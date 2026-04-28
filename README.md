@@ -1,13 +1,13 @@
-# gpt-pro
+# gpt-pro-relay
 
-CLI that drives a logged-in ChatGPT Pro browser session via Playwright. Designed to be invoked over SSH:
+Relay prompts to your logged-in ChatGPT Pro session from anywhere with SSH. Your always-on Mac drives a real Chrome via Playwright; remote agents and other machines invoke it as a CLI:
 
 ```bash
 RUN_ID=$(uuidgen)
-echo "your prompt" | ssh mac /path/to/gpt-pro/.venv/bin/gpt-pro ask --run-id "$RUN_ID"
+echo "your prompt" | ssh mac /path/to/gpt-pro-relay/.venv/bin/gpt-pro ask --run-id "$RUN_ID"
 ```
 
-Personal lazy tool. Single user, single Mac, single account.
+The CLI binary is `gpt-pro` — the repo is named `gpt-pro-relay` for the role it plays. Personal lazy tool: single user, single Mac, single account.
 
 > Browser automation against ChatGPT violates OpenAI's ToS. Account-ban risk is yours. Don't build a product on it.
 
@@ -32,7 +32,11 @@ No daemon. No HTTP server. No queue. SSH is the transport. The worker is detache
 
 ## Setup
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and Google Chrome (real Chrome, not bundled Chromium).
+Requires:
+
+- A Mac that stays logged into its GUI session. Playwright drives real Chrome and needs WindowServer access, so a headless box won't work — leave the Mac signed in (and use `caffeinate` if it sleeps).
+- Python 3.11+, [uv](https://docs.astral.sh/uv/), and Google Chrome (real Chrome, not bundled Chromium — auth and anti-abuse behave differently).
+- A ChatGPT Pro account.
 
 ```bash
 uv sync
@@ -57,7 +61,7 @@ Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. 
 ```bash
 RUN_ID=$(uuidgen)
 ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 mac \
-    /Users/you/Developer/GitHub/gpt-pro/.venv/bin/gpt-pro ask --run-id "$RUN_ID" <<'PROMPT'
+    /Users/you/Developer/GitHub/gpt-pro-relay/.venv/bin/gpt-pro ask --run-id "$RUN_ID" <<'PROMPT'
 your prompt here
 PROMPT
 ```
@@ -66,7 +70,7 @@ PROMPT
 
 ```bash
 ssh -o ServerAliveInterval=30 mac \
-    /Users/you/Developer/GitHub/gpt-pro/.venv/bin/gpt-pro fetch "$RUN_ID"
+    /Users/you/Developer/GitHub/gpt-pro-relay/.venv/bin/gpt-pro fetch "$RUN_ID"
 ```
 
 The worker survives `SIGHUP` from SSH session teardown and continues to completion. `fetch` polls the run directory and prints the response when ready. **Never re-run `ask` to recover** — that would submit a fresh prompt to ChatGPT and burn another 5–20 min of Pro reasoning.
@@ -104,5 +108,4 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 - Concurrent `ask` invocations serialize via a `flock` on `~/.gpt-pro/browser.lock` — second worker waits for first to finish before launching Chrome.
 - Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
 - Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
-- The Mac must be in a logged-in GUI session — Playwright needs WindowServer access.
 - If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.
