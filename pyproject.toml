@@ -8,6 +8,7 @@ dependencies = [
 ]
 
 [project.scripts]
+gpt-pro-relay = "gpt_pro.cli:main"
 gpt-pro = "gpt_pro.cli:main"
 
 [build-system]

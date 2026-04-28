@@ -597,7 +597,7 @@ async def cmd_run(args) -> int:
 # ---- main ----
 
 def main() -> int:
-    p = argparse.ArgumentParser(prog="gpt-pro")
+    p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="Open Chrome on chatgpt.com to sign in. Cookies persist for `ask`.")
     sub.add_parser("doctor", help="Verify the profile is logged in. Prints JSON; saves screenshot + HTML.")
