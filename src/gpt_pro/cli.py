@@ -444,21 +444,13 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
                 log_stage("chrome_launched")
 
-                # Temporary chat: keeps automation runs out of the chat history
-                # sidebar and dodges any future re-enablement of account memory.
-                # Pro IS selectable here despite the picker rendering on a slower
-                # timeline than chatgpt.com root.
-                await page.goto("https://chatgpt.com/?temporary-chat=true", wait_until="domcontentloaded")
+                await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
                 if not await wait_for_login(ctx, timeout=30.0):
                     await page.screenshot(path=str(run_dir / "error-needs_reauth.png"), full_page=True)
                     (run_dir / "error.html").write_text(await page.content())
                     log_stage("error", reason="needs_reauth")
                     return err("needs_reauth")
                 log_stage("logged_in")
-                # Settle: temp-chat hydrates a transient role=menu before the real
-                # model picker mounts. Without this, picker.click() can race
-                # wait_for_selector('[role="menu"]') against the wrong menu.
-                await asyncio.sleep(2.0)
 
                 picker = page.locator('[data-testid="model-switcher-dropdown-button"]')
                 pro = page.locator('[data-testid="model-switcher-gpt-5-5-pro"]')
