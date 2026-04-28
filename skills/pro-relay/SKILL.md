@@ -153,7 +153,7 @@ Reach for them via `ssh mac cat <run_dir>/<file>` or `ssh mac ls <run_dir>` when
 |---|---|
 | Pro Extended reasoning, from any machine with SSH to your Mac | Yes |
 | Tolerating a flaky network on a 5–20 min reasoning run | Yes (drop-recovery via `fetch`) |
-| Driving your local live Chrome with any model + effort | Use a local Chrome-driving skill instead |
+| Same machine as ChatGPT — no SSH needed | Use the `gpt-pro-local` skill instead |
 | Multi-turn follow-ups in the same chat | Doesn't fit — pro-relay is one-shot per invocation |
 
 ## Multi-turn

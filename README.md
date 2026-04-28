@@ -65,7 +65,22 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 | `gpt-pro-relay ask [--run-id ID] [--output PATH]` | Read prompt from stdin. Spawns a detached worker, waits for completion, prints response on stdout. Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check. `--output` writes to a file instead of stdout. |
 
-## SSH usage
+## Usage
+
+The CLI is the same whether you're calling it locally or relaying over SSH. Pick whichever matches your setup.
+
+### Local
+
+Same machine running ChatGPT and the caller — no transport, no wrapper:
+
+```bash
+RUN_ID=$(uuidgen)
+echo "your prompt" | gpt-pro-relay ask --run-id "$RUN_ID"
+```
+
+If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo` or call the venv binary directly. The `flock` at `~/.gpt-pro/browser.lock` still serializes concurrent runs across terminals on the same host.
+
+### Remote (SSH)
 
 **Happy path** — single command, response on stdout:
 
@@ -85,6 +100,8 @@ ssh -o ServerAliveInterval=30 mac \
 ```
 
 The worker survives `SIGHUP` from SSH session teardown and continues to completion. `fetch` polls the run directory and prints the response when ready. **Never re-run `ask` to recover** — that would submit a fresh prompt to ChatGPT and burn another 5–20 min of Pro reasoning.
+
+### Stdio contract (both modes)
 
 `stdout` is the response. `stderr` is newline-delimited JSON: a `submitted` line when the run starts, then a terminal `ok`/`error`/`timeout` line.
 
@@ -121,6 +138,11 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 - Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
 - If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.
 
-## Claude Code skill
+## Claude Code skills
 
-[`skills/pro-relay/SKILL.md`](skills/pro-relay/SKILL.md) is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that wraps the SSH command. Copy it into `~/.claude/skills/pro-relay/` and edit the `mac` SSH alias to match your own. After that, Claude triggers it on prompts like "ask gpt-pro about X" or "get a Pro Extended take on Y".
+Two [Claude Code skills](https://docs.claude.com/en/docs/claude-code/skills) ship with the repo. Copy whichever matches your setup into `~/.claude/skills/<name>/`:
+
+- [`skills/pro-relay/SKILL.md`](skills/pro-relay/SKILL.md) — wraps the SSH command. Edit the `mac` alias to your own. Use this when Claude Code is on a different machine than ChatGPT.
+- [`skills/gpt-pro-local/SKILL.md`](skills/gpt-pro-local/SKILL.md) — direct invocation, no SSH. Use this when Claude Code is on the same Mac as ChatGPT.
+
+Either way, Claude triggers on prompts like "ask gpt-pro about X" or "get a Pro Extended take on Y".
