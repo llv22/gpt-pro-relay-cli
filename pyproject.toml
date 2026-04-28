@@ -1,0 +1,18 @@
+[project]
+name = "gpt-pro"
+version = "0.1.0"
+description = "Drive a logged-in ChatGPT Pro browser session over SSH."
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.46",
+]
+
+[project.scripts]
+gpt-pro = "gpt_pro.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpt_pro"]
