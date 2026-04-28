@@ -49,8 +49,10 @@ When `_run` starts failing with `model_select_failed` or `reasoning_mismatch`, t
 ## Other fragile assumptions
 
 - **Login detection** uses cookie prefix `__Secure-next-auth.session-token` (NextAuth chunked cookies — `.0`, `.1`). If OpenAI changes their auth scheme, update `SESSION_COOKIE_PREFIX`.
-- **Completion detection is heuristic** (text-stable for 5s + no Stop button). The cleaner signal is `/backend-api/conversation/<id>/async-status` from the network log; not yet wired.
+- **Completion detection is heuristic** (text-stable for 5s + no Stop button). The async-status endpoint fires exactly once at the end of a run — our heuristic catches the same moment, so the endpoint is redundant for completion. If the heuristic ever false-positives mid-run, async-status is the obvious supplementary check to add.
 - **Anti-detection flags** (`--disable-blink-features=AutomationControlled`, dropping `--enable-automation` and `--no-sandbox`) are load-bearing. Removing them triggers ChatGPT's auth-error redirect.
+- **Extraction prefers the Copy button** via `[data-testid="copy-turn-action-button"]` (clean markdown), then `pbpaste` reads the system clipboard; falls back to `innerText` if either step fails. Result captures `extraction: "copy_button"|"innertext"` so you can audit which path won. Math, code fences, and tables are mangled under `innerText` — the fallback is only for degraded environments.
+- **Concurrent worker serialization** is a `fcntl.flock` exclusive lock on `~/.gpt-pro/browser.lock` held during the entire browser section. Required because Chrome's `SingletonLock` prevents two processes sharing a `--user-data-dir`. Kept blocking (no timeout) — agents wait their turn rather than fail-fast, which matches the queue-up-and-respond UX of the rest of the system.
 
 ## Conventions
 
@@ -68,10 +70,9 @@ Browser automation against ChatGPT violates OpenAI's terms. The user accepts the
 
 So future-Claude doesn't reflexively add it:
 
-- File lock for concurrent invocations — known gap. Two simultaneous `ask` calls will collide on Chrome's `SingletonLock`; one fails. Add when needed.
-- Markdown-fidelity extraction (Copy button or SSE parse) — `innerText` is good enough for v1.
-- `async-status` completion signal — heuristic works.
+- `async-status` completion signal — heuristic catches the same moment empirically. Wire only if the heuristic ever false-positives.
 - Auto-retry on errors — fail closed, surface the `run_dir`, let the user decide.
 - `launchd` keepalive — `tmux` is fine.
 - Sleep / clamshell handling beyond `caffeinate` — out of scope.
 - Worker liveness check / orphan detection — if the worker dies before writing `result.json`, the parent waits until `--generation-timeout`. Acceptable.
+- Lock timeout / fail-fast on busy profile — current behavior is to wait. Pro Extended runs are 5–20 min anyway; an extra wait is in the same magnitude.

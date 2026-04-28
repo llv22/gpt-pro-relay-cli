@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -12,7 +13,9 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 PROFILE = Path.home() / ".gpt-pro-profile"
-RUNS = Path.home() / ".gpt-pro" / "runs"
+STATE = Path.home() / ".gpt-pro"
+RUNS = STATE / "runs"
+BROWSER_LOCK = STATE / "browser.lock"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
@@ -271,6 +274,66 @@ async def _log_response(resp, log: list) -> None:
         pass
 
 
+async def _copy_button_extract(page) -> str | None:
+    """Click the last assistant message's Copy button and read system clipboard.
+
+    Preserves markdown fidelity (math, code fences, tables) where innerText mangles them.
+    Returns None if the copy didn't change the clipboard (button missing, permission denied,
+    not on macOS, etc.) — caller should fall back to innerText.
+    """
+    try:
+        before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+
+    clicked = False
+    try:
+        clicked = await page.evaluate("""() => {
+            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+            const last = msgs[msgs.length - 1];
+            if (!last) return false;
+            const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
+            if (!container) return false;
+            const btn = container.querySelector('[data-testid="copy-turn-action-button"]');
+            if (!btn) return false;
+            btn.click();
+            return true;
+        }""")
+    except Exception:
+        return None
+    if not clicked:
+        return None
+
+    await asyncio.sleep(0.6)
+    try:
+        after = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    if after and after != before and after.strip():
+        return after
+    return None
+
+
+class BrowserLock:
+    """Serializes access to the Chrome profile across worker processes via fcntl flock."""
+    def __init__(self, path: Path = BROWSER_LOCK):
+        self.path = path
+        self._fd = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = open(self.path, "w")
+        fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fd.close()
+            self._fd = None
+
+
 async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
     network_log: list = []
 
@@ -286,6 +349,15 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
             d.update(extra)
         return d
 
+    lock_wait_start = time.time()
+    with BrowserLock():
+        lock_wait_secs = time.time() - lock_wait_start
+        if lock_wait_secs > 1.0:
+            (run_dir / "lock_wait_secs").write_text(f"{lock_wait_secs:.1f}\n")
+        return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err)
+
+
+async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> dict:
     try:
         async with async_playwright() as pw:
             ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
@@ -360,14 +432,23 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
 
             await page.screenshot(path=str(run_dir / "final.png"), full_page=True)
             (run_dir / "final.html").write_text(await page.content())
-            atomic_write(run_dir / "response.md", last_text)
+
+            extraction = "innertext"
+            response = last_text
+            if completed:
+                copied = await _copy_button_extract(page)
+                if copied is not None:
+                    response = copied
+                    extraction = "copy_button"
+            atomic_write(run_dir / "response.md", response)
 
             return {
                 "status": "ok" if completed else "timeout",
                 "run_id": run_id,
                 "url": page.url,
                 "run_dir": str(run_dir),
-                "response_chars": len(last_text),
+                "response_chars": len(response),
+                "extraction": extraction,
                 "exit_code": 0 if completed else 3,
             }
     except Exception as e:

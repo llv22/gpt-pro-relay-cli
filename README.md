@@ -90,7 +90,7 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 
 - `prompt.md` — input
 - `meta.json` — `{run_id, created_at, prompt_sha256}`
-- `response.md` — extracted assistant message (atomic)
+- `response.md` — extracted assistant message (atomic). `result.json` reports `extraction: "copy_button"` or `"innertext"`.
 - `result.json` — terminal status (atomic)
 - `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`
 - `final.html` — last DOM snapshot
@@ -99,8 +99,8 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 
 ## Known limitations
 
-- Single-tab serialization — concurrent invocations collide on the Chrome profile (Chrome's `SingletonLock`). A file lock around the browser section is the planned fix.
-- `innerText` extraction loses code-block fidelity vs the page's "Copy" button.
-- Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint.
+- Concurrent `ask` invocations serialize via a `flock` on `~/.gpt-pro/browser.lock` — second worker waits for first to finish before launching Chrome.
+- Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
+- Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
 - The Mac must be in a logged-in GUI session — Playwright needs WindowServer access.
 - If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.
