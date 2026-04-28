@@ -43,6 +43,51 @@ def stderr_jsonl(obj: dict) -> None:
     print(json.dumps(obj, separators=(",", ":")), file=sys.stderr, flush=True)
 
 
+def log_stage(stage: str, **kwargs) -> None:
+    """JSONL progress line to the worker's stderr (which is captured to worker.stderr)."""
+    obj = {"ts": round(time.time(), 3), "stage": stage, **kwargs}
+    print(json.dumps(obj, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+def _kill_chrome_orphans() -> None:
+    """Kill any stale Chrome procs still bound to our profile.
+
+    Safe to call while holding the file lock — no other gpt-pro worker is
+    allowed to be launching Chrome, so anything matching is an orphan from a
+    SIGKILL'd or crashed previous worker. Without this, the next Chrome launch
+    fails with SingletonLock.
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={PROFILE}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return
+    pids = [p for p in out.split() if p.strip()]
+    if not pids:
+        return
+    log_stage("orphan_kill_term", pids=pids)
+    try:
+        subprocess.run(["kill", "-TERM", *pids], capture_output=True, timeout=5)
+    except Exception:
+        pass
+    time.sleep(0.5)
+    try:
+        stubborn = [p for p in subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={PROFILE}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.split() if p.strip()]
+    except Exception:
+        stubborn = []
+    if stubborn:
+        log_stage("orphan_kill_kill", pids=stubborn)
+        try:
+            subprocess.run(["kill", "-KILL", *stubborn], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
 def atomic_write(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content)
@@ -324,6 +369,7 @@ class BrowserLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = open(self.path, "w")
         fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+        _kill_chrome_orphans()
         return self
 
     def __exit__(self, *_):
@@ -349,11 +395,11 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
             d.update(extra)
         return d
 
+    log_stage("start", run_id=run_id)
     lock_wait_start = time.time()
     with BrowserLock():
         lock_wait_secs = time.time() - lock_wait_start
-        if lock_wait_secs > 1.0:
-            (run_dir / "lock_wait_secs").write_text(f"{lock_wait_secs:.1f}\n")
+        log_stage("lock_acquired", waited_secs=round(lock_wait_secs, 2))
         return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err)
 
 
@@ -363,19 +409,27 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
             ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
+            log_stage("chrome_launched")
 
+            # NOTE: We tried `?temporary-chat=true` to skip history clutter, but
+            # the picker in that mode doesn't expose `model-switcher-gpt-5-5-pro`
+            # — Pro isn't selectable from a temp chat. Memory is disabled at the
+            # account level instead.
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             if not await wait_for_login(ctx, timeout=30.0):
                 await page.screenshot(path=str(run_dir / "error-needs_reauth.png"), full_page=True)
                 (run_dir / "error.html").write_text(await page.content())
+                log_stage("error", reason="needs_reauth")
                 return err("needs_reauth")
+            log_stage("logged_in")
 
             picker = page.locator('[data-testid="model-switcher-dropdown-button"]')
             pro = page.locator('[data-testid="model-switcher-gpt-5-5-pro"]')
 
             await picker.click()
             await page.wait_for_selector('[role="menu"]', timeout=5000)
-            if await pro.get_attribute("aria-checked") != "true":
+            already_pro = await pro.get_attribute("aria-checked") == "true"
+            if not already_pro:
                 await pro.click()
                 await asyncio.sleep(0.5)
                 await picker.click()
@@ -383,21 +437,27 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 if await pro.get_attribute("aria-checked") != "true":
                     await page.screenshot(path=str(run_dir / "error-model_select_failed.png"), full_page=True)
                     (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="model_select_failed")
                     return err("model_select_failed", {"aria_checked": await pro.get_attribute("aria-checked")})
             await page.keyboard.press("Escape")
             await asyncio.sleep(0.5)
+            log_stage("model_selected", clicked=not already_pro)
 
             composer = page.get_by_role("textbox").first
             await composer.click()
             await composer.fill(prompt_text)
+            log_stage("prompt_typed", chars=len(prompt_text))
 
             if await page.locator('[aria-label*="Extended Pro"]').count() == 0:
                 await page.screenshot(path=str(run_dir / "error-reasoning_mismatch.png"), full_page=True)
                 (run_dir / "error.html").write_text(await page.content())
+                log_stage("error", reason="reasoning_mismatch")
                 return err("reasoning_mismatch")
 
             await page.screenshot(path=str(run_dir / "pre-send.png"), full_page=True)
             await page.locator('[data-testid="send-button"]').click()
+            send_ts = time.time()
+            log_stage("sent")
 
             deadline = time.time() + DEFAULT_GENERATION_TIMEOUT
             last_text = ""
@@ -430,6 +490,11 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                         break
                 await asyncio.sleep(1.5)
 
+            log_stage(
+                "completion_detected" if completed else "completion_timeout",
+                chars=len(last_text),
+                elapsed_secs=round(time.time() - send_ts, 1),
+            )
             await page.screenshot(path=str(run_dir / "final.png"), full_page=True)
             (run_dir / "final.html").write_text(await page.content())
 
@@ -440,9 +505,10 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 if copied is not None:
                     response = copied
                     extraction = "copy_button"
+            log_stage("extracted", method=extraction, chars=len(response))
             atomic_write(run_dir / "response.md", response)
 
-            return {
+            result = {
                 "status": "ok" if completed else "timeout",
                 "run_id": run_id,
                 "url": page.url,
@@ -451,7 +517,15 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 "extraction": extraction,
                 "exit_code": 0 if completed else 3,
             }
+            log_stage("finished", status=result["status"])
+            return result
     except Exception as e:
+        log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
+        try:
+            await page.screenshot(path=str(run_dir / "error-worker_exception.png"), full_page=True)
+            (run_dir / "error.html").write_text(await page.content())
+        except Exception:
+            pass
         return {
             "status": "error",
             "reason": "worker_exception",
