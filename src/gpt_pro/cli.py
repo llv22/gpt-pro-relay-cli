@@ -95,7 +95,9 @@ def atomic_write(path: Path, content: str) -> None:
 
 
 def gen_run_id() -> str:
-    return time.strftime("%Y%m%d-%H%M%S") + "-ask"
+    # 4 hex chars from os.urandom prevent collision when two `ask` calls fire
+    # in the same wall-clock second without --run-id.
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex() + "-ask"
 
 
 def validate_run_id(s: str) -> None:
@@ -354,6 +356,15 @@ async def _copy_button_extract(page) -> str | None:
         after = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return None
+
+    # Restore the user's clipboard if we changed it — the Mac mini may be in
+    # interactive use and we shouldn't clobber whatever they had copied.
+    if after != before:
+        try:
+            subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
+        except Exception:
+            pass
+
     if after and after != before and after.strip():
         return after
     return None
@@ -404,132 +415,7 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
 
 
 async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> dict:
-    try:
-        async with async_playwright() as pw:
-            ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
-            log_stage("chrome_launched")
-
-            # Temporary chat: keeps automation runs out of the chat history
-            # sidebar and dodges any future re-enablement of account memory.
-            # Pro IS selectable here despite the picker rendering on a slower
-            # timeline than chatgpt.com root.
-            await page.goto("https://chatgpt.com/?temporary-chat=true", wait_until="domcontentloaded")
-            if not await wait_for_login(ctx, timeout=30.0):
-                await page.screenshot(path=str(run_dir / "error-needs_reauth.png"), full_page=True)
-                (run_dir / "error.html").write_text(await page.content())
-                log_stage("error", reason="needs_reauth")
-                return err("needs_reauth")
-            log_stage("logged_in")
-            # Settle: temp-chat hydrates a transient role=menu before the real
-            # model picker mounts. Without this, picker.click() can race
-            # wait_for_selector('[role="menu"]') against the wrong menu.
-            await asyncio.sleep(2.0)
-
-            picker = page.locator('[data-testid="model-switcher-dropdown-button"]')
-            pro = page.locator('[data-testid="model-switcher-gpt-5-5-pro"]')
-
-            await picker.click()
-            await page.wait_for_selector('[role="menu"]', timeout=5000)
-            already_pro = await pro.get_attribute("aria-checked") == "true"
-            if not already_pro:
-                await pro.click()
-                await asyncio.sleep(0.5)
-                await picker.click()
-                await page.wait_for_selector('[role="menu"]', timeout=5000)
-                if await pro.get_attribute("aria-checked") != "true":
-                    await page.screenshot(path=str(run_dir / "error-model_select_failed.png"), full_page=True)
-                    (run_dir / "error.html").write_text(await page.content())
-                    log_stage("error", reason="model_select_failed")
-                    return err("model_select_failed", {"aria_checked": await pro.get_attribute("aria-checked")})
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.5)
-            log_stage("model_selected", clicked=not already_pro)
-
-            composer = page.get_by_role("textbox").first
-            await composer.click()
-            await composer.fill(prompt_text)
-            log_stage("prompt_typed", chars=len(prompt_text))
-
-            if await page.locator('[aria-label*="Extended Pro"]').count() == 0:
-                await page.screenshot(path=str(run_dir / "error-reasoning_mismatch.png"), full_page=True)
-                (run_dir / "error.html").write_text(await page.content())
-                log_stage("error", reason="reasoning_mismatch")
-                return err("reasoning_mismatch")
-
-            await page.screenshot(path=str(run_dir / "pre-send.png"), full_page=True)
-            await page.locator('[data-testid="send-button"]').click()
-            send_ts = time.time()
-            log_stage("sent")
-
-            deadline = time.time() + DEFAULT_GENERATION_TIMEOUT
-            last_text = ""
-            last_change = time.time()
-            snapshot_idx = 0
-            next_snap = time.time() + 5.0
-            completed = False
-            while time.time() < deadline:
-                now = time.time()
-                if now >= next_snap:
-                    await page.screenshot(path=str(run_dir / f"streaming-{snapshot_idx:03d}.png"), full_page=True)
-                    snapshot_idx += 1
-                    next_snap = now + 30.0
-                try:
-                    cur = await page.evaluate(
-                        """() => {
-                            const e = document.querySelectorAll('[data-message-author-role="assistant"]');
-                            return e.length ? e[e.length - 1].innerText : '';
-                        }"""
-                    )
-                except Exception:
-                    cur = ""
-                if cur != last_text:
-                    last_change = now
-                    last_text = cur
-                if cur and (now - last_change) >= 5.0:
-                    stop = await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
-                    if stop == 0:
-                        completed = True
-                        break
-                await asyncio.sleep(1.5)
-
-            log_stage(
-                "completion_detected" if completed else "completion_timeout",
-                chars=len(last_text),
-                elapsed_secs=round(time.time() - send_ts, 1),
-            )
-            await page.screenshot(path=str(run_dir / "final.png"), full_page=True)
-            (run_dir / "final.html").write_text(await page.content())
-
-            extraction = "innertext"
-            response = last_text
-            if completed:
-                copied = await _copy_button_extract(page)
-                if copied is not None:
-                    response = copied
-                    extraction = "copy_button"
-            log_stage("extracted", method=extraction, chars=len(response))
-            atomic_write(run_dir / "response.md", response)
-
-            result = {
-                "status": "ok" if completed else "timeout",
-                "run_id": run_id,
-                "url": page.url,
-                "run_dir": str(run_dir),
-                "response_chars": len(response),
-                "extraction": extraction,
-                "exit_code": 0 if completed else 3,
-            }
-            log_stage("finished", status=result["status"])
-            return result
-    except Exception as e:
-        log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
-        try:
-            await page.screenshot(path=str(run_dir / "error-worker_exception.png"), full_page=True)
-            (run_dir / "error.html").write_text(await page.content())
-        except Exception:
-            pass
+    def worker_exception_result(e: Exception) -> dict:
         return {
             "status": "error",
             "reason": "worker_exception",
@@ -538,6 +424,148 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
             "run_dir": str(run_dir),
             "exit_code": 1,
         }
+
+    try:
+        async with async_playwright() as pw:
+            ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
+            # Inner try/except/finally guarantees ctx.close() runs while Chrome
+            # is still alive — clean shutdown flushes the cookie/session SQLite.
+            # Worker-exception screenshots also live inside the inner try so
+            # they're captured before ctx is torn down.
+            try:
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
+                log_stage("chrome_launched")
+
+                # Temporary chat: keeps automation runs out of the chat history
+                # sidebar and dodges any future re-enablement of account memory.
+                # Pro IS selectable here despite the picker rendering on a slower
+                # timeline than chatgpt.com root.
+                await page.goto("https://chatgpt.com/?temporary-chat=true", wait_until="domcontentloaded")
+                if not await wait_for_login(ctx, timeout=30.0):
+                    await page.screenshot(path=str(run_dir / "error-needs_reauth.png"), full_page=True)
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="needs_reauth")
+                    return err("needs_reauth")
+                log_stage("logged_in")
+                # Settle: temp-chat hydrates a transient role=menu before the real
+                # model picker mounts. Without this, picker.click() can race
+                # wait_for_selector('[role="menu"]') against the wrong menu.
+                await asyncio.sleep(2.0)
+
+                picker = page.locator('[data-testid="model-switcher-dropdown-button"]')
+                pro = page.locator('[data-testid="model-switcher-gpt-5-5-pro"]')
+
+                await picker.click()
+                await page.wait_for_selector('[role="menu"]', timeout=5000)
+                already_pro = await pro.get_attribute("aria-checked") == "true"
+                if not already_pro:
+                    await pro.click()
+                    await asyncio.sleep(0.5)
+                    await picker.click()
+                    await page.wait_for_selector('[role="menu"]', timeout=5000)
+                    if await pro.get_attribute("aria-checked") != "true":
+                        await page.screenshot(path=str(run_dir / "error-model_select_failed.png"), full_page=True)
+                        (run_dir / "error.html").write_text(await page.content())
+                        log_stage("error", reason="model_select_failed")
+                        return err("model_select_failed", {"aria_checked": await pro.get_attribute("aria-checked")})
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+                log_stage("model_selected", clicked=not already_pro)
+
+                composer = page.get_by_role("textbox").first
+                await composer.click()
+                await composer.fill(prompt_text)
+                log_stage("prompt_typed", chars=len(prompt_text))
+
+                if await page.locator('[aria-label*="Extended Pro"]').count() == 0:
+                    await page.screenshot(path=str(run_dir / "error-reasoning_mismatch.png"), full_page=True)
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="reasoning_mismatch")
+                    return err("reasoning_mismatch")
+
+                await page.screenshot(path=str(run_dir / "pre-send.png"), full_page=True)
+                await page.locator('[data-testid="send-button"]').click()
+                send_ts = time.time()
+                log_stage("sent")
+
+                deadline = time.time() + DEFAULT_GENERATION_TIMEOUT
+                last_text = ""
+                last_change = time.time()
+                snapshot_idx = 0
+                next_snap = time.time() + 5.0
+                completed = False
+                while time.time() < deadline:
+                    now = time.time()
+                    if now >= next_snap:
+                        await page.screenshot(path=str(run_dir / f"streaming-{snapshot_idx:03d}.png"), full_page=True)
+                        snapshot_idx += 1
+                        next_snap = now + 30.0
+                    try:
+                        cur = await page.evaluate(
+                            """() => {
+                                const e = document.querySelectorAll('[data-message-author-role="assistant"]');
+                                return e.length ? e[e.length - 1].innerText : '';
+                            }"""
+                        )
+                    except Exception:
+                        cur = ""
+                    if cur != last_text:
+                        last_change = now
+                        last_text = cur
+                    if cur and (now - last_change) >= 5.0:
+                        stop = await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
+                        if stop == 0:
+                            completed = True
+                            break
+                    await asyncio.sleep(1.5)
+
+                log_stage(
+                    "completion_detected" if completed else "completion_timeout",
+                    chars=len(last_text),
+                    elapsed_secs=round(time.time() - send_ts, 1),
+                )
+                await page.screenshot(path=str(run_dir / "final.png"), full_page=True)
+                (run_dir / "final.html").write_text(await page.content())
+
+                extraction = "innertext"
+                response = last_text
+                if completed:
+                    copied = await _copy_button_extract(page)
+                    if copied is not None:
+                        response = copied
+                        extraction = "copy_button"
+                log_stage("extracted", method=extraction, chars=len(response))
+                atomic_write(run_dir / "response.md", response)
+
+                result = {
+                    "status": "ok" if completed else "timeout",
+                    "run_id": run_id,
+                    "url": page.url,
+                    "run_dir": str(run_dir),
+                    "response_chars": len(response),
+                    "extraction": extraction,
+                    "exit_code": 0 if completed else 3,
+                }
+                log_stage("finished", status=result["status"])
+                return result
+            except Exception as e:
+                log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
+                try:
+                    await page.screenshot(path=str(run_dir / "error-worker_exception.png"), full_page=True)
+                    (run_dir / "error.html").write_text(await page.content())
+                except Exception:
+                    pass
+                return worker_exception_result(e)
+            finally:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        # Pre-page setup error (Chrome won't launch, etc). No page to screenshot.
+        log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
+        return worker_exception_result(e)
     finally:
         try:
             (run_dir / "network.json").write_text(json.dumps(network_log, indent=2))
