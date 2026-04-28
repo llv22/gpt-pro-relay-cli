@@ -79,6 +79,10 @@ The worker survives `SIGHUP` from SSH session teardown and continues to completi
 
 Pass `--output PATH` to write the response to a file on the gpt-pro host instead. stdout stays empty; the terminal stderr line gains an `"output": "<resolved-path>"` field. Useful when the caller would rather `Read` a file than capture potentially-large stdout.
 
+## Claude Code skill
+
+[`skills/pro-relay/SKILL.md`](skills/pro-relay/SKILL.md) is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that wraps the SSH command. Copy it into `~/.claude/skills/pro-relay/` and edit the `mac` SSH alias and `/Users/you/...` path to match your setup. After that, Claude triggers it on prompts like "ask gpt-pro about X" or "get a Pro Extended take on Y".
+
 Exit codes:
 
 | code | meaning |
