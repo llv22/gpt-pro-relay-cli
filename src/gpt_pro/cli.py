@@ -193,7 +193,7 @@ def _spawn_worker(run_id: str, run_dir: Path) -> None:
     )
 
 
-async def _wait_for_result(run_dir: Path, *, poll_interval: float = 1.5, timeout: float | None = None) -> dict | None:
+async def _wait_for_result(run_dir: Path, *, poll_interval: float = 0.5, timeout: float | None = None) -> dict | None:
     """Polls run_dir/result.json until it appears or timeout. Returns parsed dict, or None on timeout."""
     result_path = run_dir / "result.json"
     deadline = (time.time() + timeout) if timeout is not None else None
@@ -209,13 +209,20 @@ async def _wait_for_result(run_dir: Path, *, poll_interval: float = 1.5, timeout
         await asyncio.sleep(poll_interval)
 
 
-def _emit_terminal(result: dict, run_dir: Path) -> int:
+def _emit_terminal(result: dict, run_dir: Path, output_path: Path | None = None) -> int:
     status = result.get("status", "error")
     if status == "ok":
         response_path = run_dir / "response.md"
         if response_path.exists():
-            sys.stdout.write(response_path.read_text())
-            sys.stdout.flush()
+            content = response_path.read_text()
+            if output_path is not None:
+                resolved = output_path.expanduser()
+                resolved.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write(resolved, content)
+                result = {**result, "output": str(resolved)}
+            else:
+                sys.stdout.write(content)
+                sys.stdout.flush()
     stderr_jsonl(result)
     if status == "ok":
         return 0
@@ -288,7 +295,7 @@ async def cmd_ask(args) -> int:
             "run_dir": str(run_dir),
         })
         return 124
-    return _emit_terminal(result, run_dir)
+    return _emit_terminal(result, run_dir, output_path=args.output)
 
 
 # ---- fetch ----
@@ -308,7 +315,7 @@ async def cmd_fetch(args) -> int:
             "run_dir": str(run_dir),
         })
         return 124
-    return _emit_terminal(result, run_dir)
+    return _emit_terminal(result, run_dir, output_path=args.output)
 
 
 # ---- _run: detached worker driving Chrome ----
@@ -608,12 +615,16 @@ def main() -> int:
                       help="Caller-supplied run id. Same id + same prompt attaches to an in-progress run.")
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,
                       help="Max seconds the parent will wait for completion (default 2100).")
+    ask_p.add_argument("--output", type=Path, default=None,
+                      help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged.")
 
     fetch_p = sub.add_parser("fetch", help="Fetch the response of an existing run by id. Waits if still running.")
     fetch_p.add_argument("run_id")
     fetch_p.add_argument("--timeout", type=float, default=None,
                         help="Max seconds to wait. Default infinite. 0 = non-blocking check.")
-    fetch_p.add_argument("--poll-interval", type=float, default=1.5)
+    fetch_p.add_argument("--poll-interval", type=float, default=0.5)
+    fetch_p.add_argument("--output", type=Path, default=None,
+                        help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged.")
 
     run_p = sub.add_parser("_run", help=argparse.SUPPRESS)
     run_p.add_argument("run_id")
