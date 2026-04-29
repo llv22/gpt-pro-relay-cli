@@ -115,6 +115,7 @@ The terminal stderr JSON's `reason` field tells you what failed:
 | `worker_exception` | Python exception in the worker | Inspect `run_dir/worker.stderr` (structured stage trace) — the last `stage` before the error tells you where it died |
 | `timeout` | no completion within 60 min | Inspect `run_dir/streaming-*.png` |
 | `empty_prompt` | nothing on stdin | You forgot the heredoc |
+| `prompt_too_large` | prompt > 1 MB | Trim or split the prompt; the cap is at submission, no Pro quota burned |
 | `run_id_conflict` | same run_id, different prompt | Pick a fresh run_id |
 | `not_found` | fetch couldn't find run_dir | The `ask` parent died before submission; re-submit fresh |
 
@@ -124,7 +125,7 @@ The terminal stderr JSON's `reason` field tells you what failed:
 |---|---|
 | 0 | response on stdout, status ok |
 | 1 | error — read stderr `reason` |
-| 2 | usage error (empty prompt, conflict, invalid run_id) |
+| 2 | usage error (empty prompt, prompt_too_large, conflict, invalid run_id) |
 | 3 | worker `timeout` (didn't finish within 60 min) |
 | 4 | run_dir not found (fetch only) |
 | 124 | wait timed out, run still pending |

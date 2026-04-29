@@ -129,7 +129,7 @@ Exit codes:
 |---|---|
 | 0 | `status: ok`, response on stdout (or `ask --no-wait` submitted; nothing on stdout) |
 | 1 | `status: error`, see `reason` field |
-| 2 | usage error (empty prompt, run_id_conflict, invalid run_id) |
+| 2 | usage error (empty prompt, prompt_too_large, run_id_conflict, invalid run_id) |
 | 3 | `status: timeout` (browser worker didn't finish within 60 min) |
 | 4 | run_dir not found (fetch only) |
 | 124 | wait timed out, run still pending |

@@ -20,6 +20,7 @@ SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
+MAX_PROMPT_BYTES = 1_000_000
 
 CHROME_ARGS = [
     "--no-first-run",
@@ -235,6 +236,16 @@ async def cmd_ask(args) -> int:
     prompt_text = sys.stdin.read()
     if not prompt_text.strip():
         stderr_jsonl({"status": "error", "reason": "empty_prompt"})
+        return 2
+
+    prompt_bytes = len(prompt_text.encode())
+    if prompt_bytes > MAX_PROMPT_BYTES:
+        stderr_jsonl({
+            "status": "error",
+            "reason": "prompt_too_large",
+            "bytes": prompt_bytes,
+            "limit": MAX_PROMPT_BYTES,
+        })
         return 2
 
     run_id = args.run_id or gen_run_id()
@@ -477,7 +488,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
                 composer = page.get_by_role("textbox").first
                 await composer.click()
-                await composer.fill(prompt_text)
+                await page.keyboard.insert_text(prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
 
                 if await page.locator('[aria-label*="Extended Pro"]').count() == 0:
