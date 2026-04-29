@@ -19,7 +19,7 @@ BROWSER_LOCK = STATE / "browser.lock"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
-DEFAULT_GENERATION_TIMEOUT = 35 * 60
+DEFAULT_GENERATION_TIMEOUT = 60 * 60
 
 CHROME_ARGS = [
     "--no-first-run",
@@ -609,7 +609,7 @@ def main() -> int:
     ask_p.add_argument("--run-id", default=None,
                       help="Caller-supplied run id. Same id + same prompt attaches to an in-progress run.")
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,
-                      help="Max seconds the parent will wait for completion (default 2100).")
+                      help="Max seconds the parent will wait for completion (default 3600).")
     ask_p.add_argument("--output", type=Path, default=None,
                       help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged. Ignored with --no-wait.")
     ask_p.add_argument("--no-wait", action="store_true",

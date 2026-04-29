@@ -94,7 +94,7 @@ your prompt here
 PROMPT
 
 # Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
-deadline=$((SECONDS + 2700)); delay=5
+deadline=$((SECONDS + 3600)); delay=5
 while (( SECONDS < deadline )); do
   out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
   case $rc in
@@ -130,7 +130,7 @@ Exit codes:
 | 0 | `status: ok`, response on stdout (or `ask --no-wait` submitted; nothing on stdout) |
 | 1 | `status: error`, see `reason` field |
 | 2 | usage error (empty prompt, run_id_conflict, invalid run_id) |
-| 3 | `status: timeout` (browser worker didn't finish within 35 min) |
+| 3 | `status: timeout` (browser worker didn't finish within 60 min) |
 | 4 | run_dir not found (fetch only) |
 | 124 | wait timed out, run still pending |
 

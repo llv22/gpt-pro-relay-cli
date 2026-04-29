@@ -36,7 +36,7 @@ ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<'PROMP
 PROMPT
 
 # Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
-deadline=$((SECONDS + 2700)); delay=5
+deadline=$((SECONDS + 3600)); delay=5
 while (( SECONDS < deadline )); do
   out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
   case $rc in
@@ -107,10 +107,10 @@ If they invoked the skill directly or named gpt-pro in their request, they've co
 
 ## Background and timeout
 
-The polling block above runs up to 45 min wall-clock. Always wrap the whole bash invocation in:
+The polling block above runs up to 60 min wall-clock. Always wrap the whole bash invocation in:
 
 - `run_in_background: true`
-- `timeout: 2700000` (45 min)
+- `timeout: 3600000` (60 min)
 
 Wait for the completion notification. Do NOT poll the output file from the agent side — the bash loop is already polling.
 
@@ -145,7 +145,7 @@ The terminal stderr JSON's `reason` field tells you what failed:
 | `model_select_failed` | couldn't get Pro selected in the picker | Selectors drifted; surface `run_dir` to the user |
 | `reasoning_mismatch` | Extended Pro chip absent after model select | Same — selectors drifted |
 | `worker_exception` | Python exception in the worker | Inspect `run_dir/worker.stderr` (structured stage trace) — the last `stage` before the error tells you where it died |
-| `timeout` | no completion within 35 min | Inspect `run_dir/streaming-*.png` |
+| `timeout` | no completion within 60 min | Inspect `run_dir/streaming-*.png` |
 | `empty_prompt` | nothing on stdin | You forgot the heredoc |
 | `run_id_conflict` | same run_id, different prompt | Pick a fresh run_id |
 | `not_found` | fetch couldn't find run_dir | The `ask` parent died before submission; re-submit fresh |
@@ -157,7 +157,7 @@ The terminal stderr JSON's `reason` field tells you what failed:
 | 0 | response on stdout, status ok (or `ask --no-wait` submitted; nothing on stdout) |
 | 1 | error — read stderr `reason` |
 | 2 | usage error (empty prompt, conflict, invalid run_id) |
-| 3 | worker `timeout` (didn't finish within 35 min) |
+| 3 | worker `timeout` (didn't finish within 60 min) |
 | 4 | run_dir not found (fetch only) |
 | 124 | wait timed out, run still pending |
 | 255 | SSH transport failure (the polling loop catches this and retries) |
