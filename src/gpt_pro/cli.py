@@ -342,6 +342,30 @@ async def _log_response(resp, log: list) -> None:
         pass
 
 
+async def _paste_prompt(page, prompt_text: str) -> None:
+    """Paste prompt_text into the focused composer via the system clipboard.
+
+    Playwright's keyboard.insert_text dispatches a single synthetic input event;
+    ProseMirror reacts by re-rendering the entire document, which chokes on
+    multi-hundred-KB inputs. Cmd+V hits the contenteditable's paste handler
+    instead, which ChatGPT's UI is optimized for. Saves and restores the user's
+    clipboard since the Mac mini may be in interactive use.
+    """
+    try:
+        before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        before = None
+    try:
+        subprocess.run(["pbcopy"], input=prompt_text, text=True, check=True, timeout=10)
+        await page.keyboard.press("Meta+V")
+    finally:
+        if before is not None:
+            try:
+                subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
+            except Exception:
+                pass
+
+
 async def _copy_button_extract(page) -> str | None:
     """Click the last assistant message's Copy button and read system clipboard.
 
@@ -488,7 +512,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
                 composer = page.get_by_role("textbox").first
                 await composer.click()
-                await page.keyboard.insert_text(prompt_text)
+                await _paste_prompt(page, prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
 
                 if await page.locator('[aria-label*="Extended Pro"]').count() == 0:
