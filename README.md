@@ -62,8 +62,8 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 |---|---|
 | `gpt-pro-relay login` | Open Chrome at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
 | `gpt-pro-relay doctor` | Verify the profile is logged in. Probes the model picker. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
-| `gpt-pro-relay ask [--run-id ID] [--output PATH]` | Read prompt from stdin. Spawns a detached worker, waits for completion, prints response on stdout. Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
-| `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check. `--output` writes to a file instead of stdout. |
+| `gpt-pro-relay ask [--run-id ID] [--no-wait] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits for completion, prints response on stdout. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
+| `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
 
 ## Usage
 
@@ -82,24 +82,40 @@ If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo`
 
 ### Remote (SSH)
 
-**Happy path** — single command, response on stdout:
+**Recommended: short-session polling.** Holding one SSH connection idle for the full 5–20 min reasoning window is brittle — NAT/firewall idle-drops mid-run are routine. Submit with `--no-wait`, then poll `fetch` with bounded timeouts:
 
 ```bash
-RUN_ID=$(uuidgen)
-ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 mac \
-    gpt-pro-relay ask --run-id "$RUN_ID" <<'PROMPT'
+SSH_OPTS=(-S none -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+RUN_ID="ask-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+# Phase 1: submit (≤1s SSH session, idempotent on same run_id + same prompt)
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<'PROMPT'
 your prompt here
 PROMPT
+
+# Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
+deadline=$((SECONDS + 2700)); delay=5
+while (( SECONDS < deadline )); do
+  out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
+  case $rc in
+    0)   printf '%s' "$out"; exit 0 ;;
+    124) delay=5; continue ;;
+    255) sleep "$delay"; (( delay < 30 )) && delay=$((delay * 2)) ;;
+    *)   cat /tmp/gpt-pro-$RUN_ID.err >&2; exit "$rc" ;;
+  esac
+done
+echo "gpt-pro-relay overall timeout for $RUN_ID" >&2; exit 124
 ```
 
-**Recovery after SSH drop:**
+The SSH options matter: `-S none` avoids ControlMaster reuse (which can resurrect stale paths), `BatchMode=yes` prevents password-prompt hangs, `ConnectTimeout=15` + `ServerAliveInterval=15`/`CountMax=4` cap a dead session at ~60s instead of 5 min. The Phase 1 submit is idempotent — same `--run-id` + same prompt bytes attaches to an existing run, so a transport-flake retry is safe.
+
+**Blocking single-call (stable links only):**
 
 ```bash
-ssh -o ServerAliveInterval=30 mac \
-    gpt-pro-relay fetch "$RUN_ID"
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" <<<prompt
 ```
 
-The worker survives `SIGHUP` from SSH session teardown and continues to completion. `fetch` polls the run directory and prints the response when ready. **Never re-run `ask` to recover** — that would submit a fresh prompt to ChatGPT and burn another 5–20 min of Pro reasoning.
+If the SSH session drops mid-run, **never re-run `ask`** — that would submit a fresh prompt and burn another 5–20 min of Pro reasoning. Recover with `gpt-pro-relay fetch "$RUN_ID"` (or just enter the polling loop above).
 
 ### Stdio contract (both modes)
 
@@ -111,7 +127,7 @@ Exit codes:
 
 | code | meaning |
 |---|---|
-| 0 | `status: ok`, response on stdout |
+| 0 | `status: ok`, response on stdout (or `ask --no-wait` submitted; nothing on stdout) |
 | 1 | `status: error`, see `reason` field |
 | 2 | usage error (empty prompt, run_id_conflict, invalid run_id) |
 | 3 | `status: timeout` (browser worker didn't finish within 35 min) |

@@ -278,13 +278,16 @@ async def cmd_ask(args) -> int:
             "prompt_sha256": prompt_sha,
         }
         atomic_write(run_dir / "meta.json", json.dumps(meta))
+        _spawn_worker(run_id, run_dir)
         stderr_jsonl({
             "status": "submitted",
             "run_id": run_id,
             "run_dir": str(run_dir),
             "prompt_sha256": prompt_sha,
         })
-        _spawn_worker(run_id, run_dir)
+
+    if args.no_wait:
+        return 0
 
     result = await _wait_for_result(run_dir, timeout=args.generation_timeout)
     if result is None:
@@ -608,7 +611,9 @@ def main() -> int:
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,
                       help="Max seconds the parent will wait for completion (default 2100).")
     ask_p.add_argument("--output", type=Path, default=None,
-                      help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged.")
+                      help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged. Ignored with --no-wait.")
+    ask_p.add_argument("--no-wait", action="store_true",
+                      help="Submit (or attach to) the run and exit 0 immediately after `submitted`. Use `fetch` to retrieve the response. Designed for short-session SSH polling — see SKILL.md.")
 
     fetch_p = sub.add_parser("fetch", help="Fetch the response of an existing run by id. Waits if still running.")
     fetch_p.add_argument("run_id")

@@ -37,6 +37,15 @@ PROMPT
 
 Use a heredoc, never `echo "$prompt"` — bare echo mangles `$`, backticks, and quotes.
 
+### Fire-and-forget variant
+
+If the calling process is itself fragile (e.g. you're about to swap shells), submit without blocking and fetch later:
+
+```bash
+gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<<prompt   # exits 0 in ~1s after spawning the worker
+gpt-pro-relay fetch "$RUN_ID"                              # blocks until response ready
+```
+
 ## Output: stdout or file
 
 Default: response on stdout. Pass `--output PATH` to write to a file instead — handy for `Read`-ing large responses without piping through the model's context:

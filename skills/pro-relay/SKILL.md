@@ -5,9 +5,11 @@ description: |
   Use this whenever the user wants a deep ChatGPT Pro response from a machine that's not their
   primary Chrome session — triggers on "ask gpt-pro", "send to gpt-pro", "use gpt-pro", "get a
   Pro Extended take", "ask the deep model", "second opinion from chatgpt pro". Returns response
-  on stdout. Resilient to SSH drops via caller-supplied `--run-id` plus a `fetch` recovery
-  command. Replace the `mac` SSH alias below with your own; `gpt-pro-relay` is assumed to be on
-  the remote shell's PATH (see the repo's "Optional: bare command on PATH" setup note).
+  on stdout. Resilient to flaky networks via a short-session polling pattern (`ask --no-wait`
+  followed by `fetch --timeout 60` in a retry loop) — no single SSH session ever sits idle for
+  the full 5–20 min reasoning duration. Replace the `mac` SSH alias below with your own;
+  `gpt-pro-relay` is assumed to be on the remote shell's PATH (see the repo's "Optional: bare
+  command on PATH" setup note).
 allowed-tools: Bash(ssh:*), Bash(uuidgen:*), Bash(date:*), Read, Write
 user-invocable: true
 ---
@@ -20,48 +22,80 @@ One prompt in, one response out. The browser automation runs on mac behind SSH a
 
 > **About the bare `gpt-pro-relay` command:** it's not a system tool. The remote shell finds it because the project ships a console script (in `.venv/bin/gpt-pro-relay`) that's symlinked into a directory on the SSH non-interactive `PATH` (e.g. `~/.local/bin/gpt-pro-relay`). If you get `gpt-pro-relay: command not found`, the symlink isn't set up — fall back to the absolute venv path (`<repo>/.venv/bin/gpt-pro-relay`) or follow the repo's "Optional: bare command on PATH" setup.
 
+Two phases: a 1-second `--no-wait` submit, then a polling loop where each
+SSH session lasts ≤60s. A NAT/firewall idle-drop on any single session
+just costs one retry instead of the whole run.
+
 ```bash
+SSH_OPTS=(-S none -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 RUN_ID="ask-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
-ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=10 mac \
-    gpt-pro-relay ask --run-id "$RUN_ID" <<'PROMPT'
+# Phase 1: submit (≤1s SSH session; idempotent on same run_id + same prompt)
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<'PROMPT'
 ... the prompt ...
 PROMPT
+
+# Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
+deadline=$((SECONDS + 2700)); delay=5
+while (( SECONDS < deadline )); do
+  out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
+  case $rc in
+    0)   printf '%s' "$out"; exit 0 ;;
+    124) delay=5; continue ;;                              # still pending
+    255) sleep "$delay"; (( delay < 30 )) && delay=$((delay * 2)) ;;  # ssh died
+    *)   cat /tmp/gpt-pro-$RUN_ID.err >&2; exit "$rc" ;;   # terminal error
+  esac
+done
+echo "gpt-pro-relay overall timeout for $RUN_ID" >&2; exit 124
 ```
 
-- **stdout** = the ChatGPT response (markdown, captured via the page's Copy button when possible)
-- **stderr** = newline-delimited JSON: a `submitted` line first, then a terminal `ok` / `error` / `timeout` line. The `ok` line includes `extraction: "copy_button" | "innertext"` so you can audit which capture path won.
+- **stdout** of the whole block = the ChatGPT response (markdown, captured via Copy button when possible)
+- **stderr** = newline-delimited JSON: a `submitted` line from Phase 1, then a terminal `ok` / `error` / `timeout` from the final fetch. The `ok` line includes `extraction: "copy_button" | "innertext"` so you can audit which capture path won.
 - **exit 0** = success. Other codes mean inspect stderr.
 
-**Always pass `--run-id`.** A caller-supplied id is the recovery handle if SSH drops. Use a UUID or timestamp+UUID — anything matching `[A-Za-z0-9._-]+`.
+Always pass `--run-id`. Use a UUID or timestamp+UUID — anything matching `[A-Za-z0-9._-]+`. Same id + same prompt bytes attaches to an existing run instead of submitting a new one (`submitted` JSONL gains `"attached": true`), so the Phase 1 submit is safe to retry on transport flakiness.
 
 Use a heredoc, never `echo "$prompt"` — bare echo mangles `$`, backticks, and quotes.
 
+### SSH options (load-bearing)
+- `ConnectTimeout=15` — bail in 15s on a dead connect.
+- `ServerAliveInterval=15` + `ServerAliveCountMax=4` — bound a dead established session to ~60s.
+- `BatchMode=yes` — never prompt for a password (would hang an agent forever).
+- `-S none` — no ControlMaster reuse; reuse can resurrect a stale network path.
+
+### Fallback: blocking single-call
+
+For stable links (or local invocation, where you should prefer the `gpt-pro-local` skill anyway), the older blocking form still works:
+
+```bash
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" <<'PROMPT'
+... the prompt ...
+PROMPT
+```
+
+This holds the SSH session open for the full 5–20 min reasoning duration. A single NAT/firewall idle-drop kills the run from the caller's view (the worker on mac survives — recover with `gpt-pro-relay fetch $RUN_ID`, ideally inside the polling loop). Default to the polling pattern.
+
 ## Output: stdout or file
 
-By default the response is on stdout. If you'd rather end up with a markdown file (for `Read`, large responses, or to keep your own stdout pipeline clean), two patterns work:
+By default the response is on stdout (from the polling block's `printf '%s' "$out"` on success). If you'd rather end up with a file:
 
-**Shell redirect** — simpler, file lives on the *caller's* machine:
-
-```bash
-ssh -o ServerAliveInterval=30 mac \
-    gpt-pro-relay ask --run-id "$RUN_ID" <<'PROMPT' > /tmp/response-$RUN_ID.md
-... the prompt ...
-PROMPT
-```
-
-**`--output PATH`** — file lives on mac (the gpt-pro-relay host); stdout is empty; terminal stderr JSON gains `"output": "<resolved-path>"`:
+**Caller-side redirect** — file on the *caller's* machine:
 
 ```bash
-ssh mac gpt-pro-relay \
-    ask --run-id "$RUN_ID" --output ~/responses/$RUN_ID.md <<'PROMPT'
-... the prompt ...
-PROMPT
-# Read it back from mac if the caller needs the contents locally:
-ssh mac cat ~/responses/$RUN_ID.md
+# In the polling block, replace the success branch with:
+0)   printf '%s' "$out" > /tmp/response-$RUN_ID.md; exit 0 ;;
 ```
 
-Use shell redirect when you want the file on the caller's machine — one fewer hop. Use `--output` when driving gpt-pro-relay from the same host (e.g. an agent running directly on mac), where the file can be `Read` directly. `fetch` accepts `--output` too.
+**`--output PATH` on `fetch`** — file on mac; the polling block's stdout stays empty; terminal stderr JSON gains `"output": "<resolved-path>"`:
+
+```bash
+# Replace the fetch line in the polling block with:
+out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --output ~/responses/$RUN_ID.md --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
+# Read it back from mac when the run is done:
+ssh "${SSH_OPTS[@]}" mac cat ~/responses/$RUN_ID.md
+```
+
+Caller-side redirect is one fewer SSH hop. `--output` on `fetch` is mainly useful when driving gpt-pro-relay from the same host (use the `gpt-pro-local` skill instead). `--output` on `ask --no-wait` is silently ignored — the response only exists at fetch time.
 
 ## Cost gate
 
@@ -73,37 +107,29 @@ If they invoked the skill directly or named gpt-pro in their request, they've co
 
 ## Background and timeout
 
-`gpt-pro-relay ask` blocks for the full reasoning duration. Always:
+The polling block above runs up to 45 min wall-clock. Always wrap the whole bash invocation in:
 
 - `run_in_background: true`
-- `timeout: 1800000` (30 min, well above typical max)
+- `timeout: 2700000` (45 min)
 
-Wait for the completion notification. Do NOT poll the output file.
+Wait for the completion notification. Do NOT poll the output file from the agent side — the bash loop is already polling.
 
-## SSH-drop recovery
+## Manual recovery
 
-If the background task completes with a non-zero exit AND you have the `run_id`, do NOT re-run `ask` — that submits a fresh prompt and burns another 5–20 min of Pro reasoning. Instead:
-
-```bash
-ssh -o ServerAliveInterval=30 mac \
-    gpt-pro-relay fetch "$RUN_ID"
-```
-
-The detached worker on mac survived the SSH drop. `fetch` polls `result.json` and prints the response on stdout when ready. Same exit codes as `ask`.
-
-Quick "is it done yet" check (non-blocking):
+If you launched a *blocking* `ask` (not the polling pattern) and SSH dropped, do NOT re-run `ask` without `--no-wait` — that holds another long SSH session open. Recover by entering the polling loop with the same `RUN_ID`, or do a one-shot manual fetch:
 
 ```bash
-ssh mac gpt-pro-relay fetch "$RUN_ID" --timeout 0
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID"   # blocks until ready
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 0  # non-blocking check
 ```
 
-Exit 124 means still running. Exit 4 means `not_found` — the run never reached mac (SSH died before the parent read stdin).
+Exit 124 = still running. Exit 4 = `not_found` (the run never reached mac — SSH died before the parent read stdin; submit again with the same run_id).
 
 ## Idempotent re-attach
 
-Re-running `ask` with the **same `--run-id` and the same prompt bytes** attaches to the existing run instead of submitting a new one. The `submitted` JSONL line will include `"attached": true`. Useful when you want a single command that handles both fresh and recovery cases without branching.
+`ask` with the **same `--run-id` and same prompt bytes** attaches to the existing run instead of submitting a new one. The `submitted` JSONL gains `"attached": true`. This is what makes Phase 1 of the polling pattern safe to retry — if the submit SSH session drops mid-flight, just run it again with the same `RUN_ID`.
 
-Re-running with the same `run_id` but a **different** prompt exits 2 with `run_id_conflict` — gpt-pro-relay refuses to overwrite, by design.
+Same `run_id` with a **different** prompt exits 2 with `run_id_conflict` — gpt-pro-relay refuses to overwrite, by design.
 
 ## Concurrency
 
@@ -128,12 +154,13 @@ The terminal stderr JSON's `reason` field tells you what failed:
 
 | code | meaning |
 |---|---|
-| 0 | response on stdout, status ok |
+| 0 | response on stdout, status ok (or `ask --no-wait` submitted; nothing on stdout) |
 | 1 | error — read stderr `reason` |
 | 2 | usage error (empty prompt, conflict, invalid run_id) |
 | 3 | worker `timeout` (didn't finish within 35 min) |
 | 4 | run_dir not found (fetch only) |
 | 124 | wait timed out, run still pending |
+| 255 | SSH transport failure (the polling loop catches this and retries) |
 
 ## Run artifacts
 
@@ -152,7 +179,7 @@ Reach for them via `ssh mac cat <run_dir>/<file>` or `ssh mac ls <run_dir>` when
 | Situation | Verdict |
 |---|---|
 | Pro Extended reasoning, from any machine with SSH to your Mac | Yes |
-| Tolerating a flaky network on a 5–20 min reasoning run | Yes (drop-recovery via `fetch`) |
+| Tolerating a flaky network on a 5–20 min reasoning run | Yes — the polling pattern handles drops without intervention |
 | Same machine as ChatGPT — no SSH needed | Use the `gpt-pro-local` skill instead |
 | Multi-turn follow-ups in the same chat | Doesn't fit — pro-relay is one-shot per invocation |
 
