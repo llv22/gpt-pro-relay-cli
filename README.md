@@ -7,7 +7,7 @@ RUN_ID=$(uuidgen)
 echo "your prompt" | ssh mac gpt-pro-relay ask --run-id "$RUN_ID"
 ```
 
-`uv sync` installs both `gpt-pro-relay` (canonical name, matches the repo) and `gpt-pro` (kept for backward compatibility) into the project's venv. Personal lazy tool: single user, single Mac, single account.
+`uv sync` installs `gpt-pro-relay` into the project's venv.
 
 > Browser automation against ChatGPT violates OpenAI's ToS. Account-ban risk is yours. Don't build a product on it.
 

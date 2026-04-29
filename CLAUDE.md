@@ -35,7 +35,7 @@ Use `atomic_write(path, content)` for `prompt.md`, `meta.json`, `response.md`, `
 
 ## Selectors — expect breakage here
 
-ChatGPT changes these without notice. Current truth (verified via `gpt-pro doctor` artifacts):
+ChatGPT changes these without notice. Current truth (verified via `gpt-pro-relay doctor` artifacts):
 
 - Picker button: `[data-testid="model-switcher-dropdown-button"]`
 - Pro menuitem: `[data-testid="model-switcher-gpt-5-5-pro"]`, `aria-checked` is the selection signal
