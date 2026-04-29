@@ -117,6 +117,82 @@ async def is_logged_in(ctx) -> bool:
     return any(c["name"].startswith(SESSION_COOKIE_PREFIX) for c in cookies)
 
 
+# Composer chip combines model + reasoning. Extended reasoning is gated to Pro models,
+# so the chip text alone is sufficient to verify both axes — same fail-closed guarantee
+# as the old (model picker + reasoning chip) pair. ChatGPT relabeled this from
+# "Extended Pro" to plain "Extended" sometime in the 2026-04 redesign window (the
+# "Pro" suffix is implicit since Extended is Pro-only).
+COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
+EXPECTED_CHIP_TEXT = "Extended"
+
+
+SSR_CHIP_PLACEHOLDER = "Model"  # Server-rendered text before React hydrates the user's actual selection.
+
+
+async def read_composer_chip_text(page, *, timeout: float = 30.0) -> str:
+    """Read the composer chip's text after React hydration.
+
+    The chip's SSR text is 'Model'; hydration replaces it with the user's
+    selected mode ('Extended', 'Auto', etc.). We poll until the placeholder is
+    gone — reading too early would cause a self-correction click on an
+    unhydrated chip, which doesn't open the menu.
+    """
+    chip = page.locator(COMPOSER_CHIP).first
+    await chip.wait_for(state="visible", timeout=timeout * 1000)
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        last = (await chip.inner_text()).strip()
+        if last and last != SSR_CHIP_PLACEHOLDER:
+            return last
+        await asyncio.sleep(0.2)
+    return last
+
+
+async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
+    """Make the composer chip read EXPECTED_CHIP_TEXT. Returns (ok, observed_text).
+
+    The chip is a Radix menu trigger — clicking it mounts a portal with
+    role='menu' containing role='menuitem' children. We click the matching item
+    by its accessible name. Idempotent: if the chip is already correct, the menu
+    is never opened.
+    """
+    chip = page.locator(COMPOSER_CHIP).first
+    text = await read_composer_chip_text(page, timeout=30.0)
+    if text == EXPECTED_CHIP_TEXT:
+        return True, text
+
+    await chip.click()
+    try:
+        await page.wait_for_selector('[role="menu"]', timeout=5000)
+    except Exception as e:
+        await page.screenshot(path=str(run_dir / "error-chip_menu_open.png"), full_page=True)
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
+        return False, text
+
+    item = page.get_by_role("menuitem", name=EXPECTED_CHIP_TEXT)
+    try:
+        await item.first.click(timeout=5000)
+    except Exception as e:
+        await page.screenshot(path=str(run_dir / "error-chip_menuitem.png"), full_page=True)
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
+        await page.keyboard.press("Escape")
+        return False, text
+
+    # Poll up to 5s for the chip text to update — Radix unmounts the menu and
+    # the chip re-renders with the newly selected label.
+    deadline = time.time() + 5.0
+    final_text = text
+    while time.time() < deadline:
+        final_text = (await chip.inner_text()).strip()
+        if final_text == EXPECTED_CHIP_TEXT:
+            return True, final_text
+        await asyncio.sleep(0.2)
+    return False, final_text
+
+
 async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -141,22 +217,19 @@ async def cmd_doctor() -> int:
         ok = await wait_for_login(ctx, timeout=30.0)
         await page.screenshot(path=str(run_dir / "page.png"), full_page=True)
         (run_dir / "page.html").write_text(await page.content())
-        picker_status = "skipped"
+        chip_status = "skipped"
+        chip_text = None
         if ok:
             try:
-                await page.locator('[data-testid="model-switcher-dropdown-button"]').click()
-                await page.wait_for_selector('[role="menu"], [role="listbox"]', timeout=5000)
-                await asyncio.sleep(0.5)
-                await page.screenshot(path=str(run_dir / "picker.png"), full_page=True)
-                (run_dir / "picker.html").write_text(await page.content())
-                await page.keyboard.press("Escape")
-                picker_status = "ok"
+                chip_text = await read_composer_chip_text(page, timeout=10.0)
+                chip_status = "ok" if chip_text == EXPECTED_CHIP_TEXT else f"unexpected: {chip_text!r}"
             except Exception as e:
-                picker_status = f"failed: {type(e).__name__}: {e}"
+                chip_status = f"failed: {type(e).__name__}: {e}"
         result = {
             "status": "ok" if ok else "needs_reauth",
             "url": page.url,
-            "picker": picker_status,
+            "chip": chip_status,
+            "chip_text": chip_text,
             "run_dir": str(run_dir),
         }
         await ctx.close()
@@ -490,39 +563,24 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                     return err("needs_reauth")
                 log_stage("logged_in")
 
-                picker = page.locator('[data-testid="model-switcher-dropdown-button"]')
-                pro = page.locator('[data-testid="model-switcher-gpt-5-5-pro"]')
-
-                await picker.click()
-                await page.wait_for_selector('[role="menu"]', timeout=5000)
-                already_pro = await pro.get_attribute("aria-checked") == "true"
-                if not already_pro:
-                    await pro.click()
-                    await asyncio.sleep(0.5)
-                    await picker.click()
-                    await page.wait_for_selector('[role="menu"]', timeout=5000)
-                    if await pro.get_attribute("aria-checked") != "true":
-                        await page.screenshot(path=str(run_dir / "error-model_select_failed.png"), full_page=True)
-                        (run_dir / "error.html").write_text(await page.content())
-                        log_stage("error", reason="model_select_failed")
-                        return err("model_select_failed", {"aria_checked": await pro.get_attribute("aria-checked")})
-                await page.keyboard.press("Escape")
-                await asyncio.sleep(0.5)
-                log_stage("model_selected", clicked=not already_pro)
+                ok, chip_text = await ensure_extended_chip(page, run_dir=run_dir)
+                if not ok:
+                    await page.screenshot(path=str(run_dir / "error-model_select_failed.png"), full_page=True)
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="model_select_failed", chip_text=chip_text)
+                    return err("model_select_failed", {"chip_text": chip_text})
+                log_stage("model_verified", chip_text=chip_text)
 
                 composer = page.get_by_role("textbox").first
                 await composer.click()
                 await _paste_prompt(page, prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
 
-                if await page.locator('[aria-label*="Extended Pro"]').count() == 0:
-                    await page.screenshot(path=str(run_dir / "error-reasoning_mismatch.png"), full_page=True)
-                    (run_dir / "error.html").write_text(await page.content())
-                    log_stage("error", reason="reasoning_mismatch")
-                    return err("reasoning_mismatch")
-
                 await page.screenshot(path=str(run_dir / "pre-send.png"), full_page=True)
-                await page.locator('[data-testid="send-button"]').click()
+                send_btn = page.locator(
+                    '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
+                ).first
+                await send_btn.click()
                 send_ts = time.time()
                 log_stage("sent")
 

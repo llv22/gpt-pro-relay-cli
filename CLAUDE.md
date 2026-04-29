@@ -11,7 +11,7 @@ The shape was chosen after a multi-perspective design review converged on the sm
 - **No daemon / launchd.** `tmux` is enough until something specifically demands persistence.
 - **One `launch_kwargs()`** in `cli.py` — login, doctor, and `_run` (worker) all use the *exact* same Chrome flags. Diverging flags = subtle auth drift.
 - **Real Chrome (`channel="chrome"`)**, not bundled Chromium. Auth/anti-abuse behaves differently.
-- **Fail closed on model + reasoning.** The worker opens the picker, asserts `aria-checked="true"` on the Pro item, clicks if not, re-verifies. Same idempotent pattern for the Extended Pro chip after typing the prompt. Never send to a model we haven't verified.
+- **Fail closed on model + reasoning.** The worker reads the composer chip's text and asserts it equals `"Extended"` (the consolidated model+reasoning label — Extended reasoning is gated to Pro models, so the single string verifies both axes; the visible label was shortened from "Extended Pro" → "Extended" in the 2026-04 redesign with "Pro" now implicit). Never send to a model we haven't verified.
 
 ## ask / fetch / _run — the submit-and-wait architecture
 
@@ -37,14 +37,13 @@ Use `atomic_write(path, content)` for `prompt.md`, `meta.json`, `response.md`, `
 
 ChatGPT changes these without notice. Current truth (verified via `gpt-pro-relay doctor` artifacts):
 
-- Picker button: `[data-testid="model-switcher-dropdown-button"]`
-- Pro menuitem: `[data-testid="model-switcher-gpt-5-5-pro"]`, `aria-checked` is the selection signal
-- Reasoning chip: `[aria-label="Extended Pro, click to remove"]` — only visible when composer has content; "click to remove" suffix means active
-- Composer: `page.get_by_role("textbox").first` (works for textarea or contenteditable)
-- Send button: `[data-testid="send-button"]`
+- Model+reasoning chip (composer-embedded): `button.__composer-pill[aria-haspopup="menu"]`. Visible text is the entire signal — `"Extended"` means GPT-5.5 Pro + Extended reasoning ("Pro" is implicit since Extended is Pro-only). The chip's SSR text is `"Model"` until React hydrates, so always wait for visible state before reading. There is no separate top-bar model picker anymore (removed in the 2026-04 redesign). If chip text drifts to anything else, the worker clicks the chip and selects the `"Extended"` menu item before failing closed.
+- Composer: `page.get_by_role("textbox").first` (works for textarea or contenteditable; the underlying `id="prompt-textarea"` is the contenteditable)
+- Send button: `[data-testid="send-button"]` is still primary; resilient fallback is `button[aria-label="Send prompt"]` / `button[aria-label="Send message"]`. Send button is only mounted when composer has content — never assert it before pasting.
 - Assistant messages: `[data-message-author-role="assistant"]`
+- Copy button (extraction): `[data-testid="copy-turn-action-button"]` inside the assistant message's `[data-testid^="conversation-turn"]` container.
 
-When `_run` starts failing with `model_select_failed` or `reasoning_mismatch`, the screenshots in `~/.gpt-pro/runs/<run_id>/error-*.png` are the diagnostic.
+When `_run` starts failing with `model_select_failed`, the screenshots + `error.html` in `~/.gpt-pro/runs/<run_id>/` are the diagnostic. The `error.html` is `page.content()` at the moment of failure — grep it for testids and aria-labels to find the new selectors before patching blind.
 
 ## Other fragile assumptions
 
