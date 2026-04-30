@@ -117,13 +117,20 @@ async def is_logged_in(ctx) -> bool:
     return any(c["name"].startswith(SESSION_COOKIE_PREFIX) for c in cookies)
 
 
-# Composer chip combines model + reasoning. Extended reasoning is gated to Pro models,
-# so the chip text alone is sufficient to verify both axes — same fail-closed guarantee
-# as the old (model picker + reasoning chip) pair. ChatGPT relabeled this from
-# "Extended Pro" to plain "Extended" sometime in the 2026-04 redesign window (the
-# "Pro" suffix is implicit since Extended is Pro-only).
+# Composer chip combines model + reasoning. Extended reasoning is gated to Pro
+# models, so any label containing "Extended" verifies both axes — same fail-closed
+# guarantee as the old (model picker + reasoning chip) pair. We match by predicate
+# rather than exact string because ChatGPT renders this label inconsistently:
+# observed values include "Extended" and "Extended Pro" (varies with A/B tests
+# and/or the chip's responsive truncation classes — `max-w-40 truncate` and
+# `[[data-collapse-labels]_&]:sr-only`). Either is correct.
 COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
-EXPECTED_CHIP_TEXT = "Extended"
+EXTENDED_TOKEN = "Extended"
+
+
+def is_extended_label(text: str | None) -> bool:
+    """Predicate for any chip/menuitem label that means 'Extended reasoning'."""
+    return bool(text) and EXTENDED_TOKEN in text
 
 
 SSR_CHIP_PLACEHOLDER = "Model"  # Server-rendered text before React hydrates the user's actual selection.
@@ -133,9 +140,9 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0) -> str:
     """Read the composer chip's text after React hydration.
 
     The chip's SSR text is 'Model'; hydration replaces it with the user's
-    selected mode ('Extended', 'Auto', etc.). We poll until the placeholder is
-    gone — reading too early would cause a self-correction click on an
-    unhydrated chip, which doesn't open the menu.
+    selected mode ('Extended', 'Extended Pro', 'Auto', etc.). We poll until the
+    placeholder is gone — reading too early would cause a self-correction click
+    on an unhydrated chip, which doesn't open the menu.
     """
     chip = page.locator(COMPOSER_CHIP).first
     await chip.wait_for(state="visible", timeout=timeout * 1000)
@@ -150,16 +157,15 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0) -> str:
 
 
 async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
-    """Make the composer chip read EXPECTED_CHIP_TEXT. Returns (ok, observed_text).
+    """Make the composer chip read an Extended-reasoning label. Returns (ok, observed_text).
 
     The chip is a Radix menu trigger — clicking it mounts a portal with
-    role='menu' containing role='menuitem' children. We click the matching item
-    by its accessible name. Idempotent: if the chip is already correct, the menu
-    is never opened.
+    role='menu' containing role='menuitem' children. Idempotent: if the chip is
+    already on an Extended label, the menu is never opened.
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
-    if text == EXPECTED_CHIP_TEXT:
+    if is_extended_label(text):
         return True, text
 
     await chip.click()
@@ -171,7 +177,9 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
         log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
         return False, text
 
-    item = page.get_by_role("menuitem", name=EXPECTED_CHIP_TEXT)
+    # Match any menuitem whose accessible name contains "Extended" (handles both
+    # "Extended" and "Extended Pro" variants without re-patching).
+    item = page.get_by_role("menuitem", name=re.compile(EXTENDED_TOKEN))
     try:
         await item.first.click(timeout=5000)
     except Exception as e:
@@ -187,7 +195,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
     final_text = text
     while time.time() < deadline:
         final_text = (await chip.inner_text()).strip()
-        if final_text == EXPECTED_CHIP_TEXT:
+        if is_extended_label(final_text):
             return True, final_text
         await asyncio.sleep(0.2)
     return False, final_text
@@ -222,7 +230,7 @@ async def cmd_doctor() -> int:
         if ok:
             try:
                 chip_text = await read_composer_chip_text(page, timeout=10.0)
-                chip_status = "ok" if chip_text == EXPECTED_CHIP_TEXT else f"unexpected: {chip_text!r}"
+                chip_status = "ok" if is_extended_label(chip_text) else f"unexpected: {chip_text!r}"
             except Exception as e:
                 chip_status = f"failed: {type(e).__name__}: {e}"
         result = {

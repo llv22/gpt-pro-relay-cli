@@ -11,7 +11,7 @@ The shape was chosen after a multi-perspective design review converged on the sm
 - **No daemon / launchd.** `tmux` is enough until something specifically demands persistence.
 - **One `launch_kwargs()`** in `cli.py` — login, doctor, and `_run` (worker) all use the *exact* same Chrome flags. Diverging flags = subtle auth drift.
 - **Real Chrome (`channel="chrome"`)**, not bundled Chromium. Auth/anti-abuse behaves differently.
-- **Fail closed on model + reasoning.** The worker reads the composer chip's text and asserts it equals `"Extended"` (the consolidated model+reasoning label — Extended reasoning is gated to Pro models, so the single string verifies both axes; the visible label was shortened from "Extended Pro" → "Extended" in the 2026-04 redesign with "Pro" now implicit). Never send to a model we haven't verified.
+- **Fail closed on model + reasoning.** The worker reads the composer chip's text and asserts it *contains* `"Extended"` — Extended reasoning is gated to Pro models, so any "Extended" label verifies both axes. Match by predicate (`"Extended" in text`), never exact string: ChatGPT renders this label inconsistently (`"Extended"` and `"Extended Pro"` both observed in production within hours of each other; varies with A/B tests and the chip's responsive truncation classes). Tightening this back to exact match caused a same-day regression — don't. Never send to a model we haven't verified.
 
 ## ask / fetch / _run — the submit-and-wait architecture
 
@@ -37,7 +37,7 @@ Use `atomic_write(path, content)` for `prompt.md`, `meta.json`, `response.md`, `
 
 ChatGPT changes these without notice. Current truth (verified via `gpt-pro-relay doctor` artifacts):
 
-- Model+reasoning chip (composer-embedded): `button.__composer-pill[aria-haspopup="menu"]`. Visible text is the entire signal — `"Extended"` means GPT-5.5 Pro + Extended reasoning ("Pro" is implicit since Extended is Pro-only). The chip's SSR text is `"Model"` until React hydrates, so always wait for visible state before reading. There is no separate top-bar model picker anymore (removed in the 2026-04 redesign). If chip text drifts to anything else, the worker clicks the chip and selects the `"Extended"` menu item before failing closed.
+- Model+reasoning chip (composer-embedded): `button.__composer-pill[aria-haspopup="menu"]`. Visible text is the entire signal — any label *containing* `"Extended"` (e.g. `"Extended"` or `"Extended Pro"`) means GPT-5.5 Pro + Extended reasoning. The chip's SSR text is `"Model"` until React hydrates, so always wait for visible state before reading. There is no separate top-bar model picker anymore (removed in the 2026-04 redesign). If the chip text doesn't match the predicate, the worker clicks the chip and picks the first menuitem whose accessible name matches `re.compile("Extended")` before failing closed.
 - Composer: `page.get_by_role("textbox").first` (works for textarea or contenteditable; the underlying `id="prompt-textarea"` is the contenteditable)
 - Send button: `[data-testid="send-button"]` is still primary; resilient fallback is `button[aria-label="Send prompt"]` / `button[aria-label="Send message"]`. Send button is only mounted when composer has content — never assert it before pasting.
 - Assistant messages: `[data-message-author-role="assistant"]`
