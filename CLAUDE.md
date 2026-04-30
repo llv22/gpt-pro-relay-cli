@@ -49,7 +49,7 @@ When `_run` starts failing with `model_select_failed`, the screenshots + `error.
 ## Other fragile assumptions
 
 - **Login detection** uses cookie prefix `__Secure-next-auth.session-token` (NextAuth chunked cookies — `.0`, `.1`). If OpenAI changes their auth scheme, update `SESSION_COOKIE_PREFIX`.
-- **Completion detection is heuristic** (text-stable for 5s + no Stop button). The async-status endpoint fires exactly once at the end of a run — our heuristic catches the same moment, so the endpoint is redundant for completion. If the heuristic ever false-positives mid-run, async-status is the obvious supplementary check to add.
+- **Completion detection requires three signals**: text stable 5s + no Stop button + Copy button mounted on the latest assistant turn (`[data-testid="copy-turn-action-button"]` inside the `[data-testid^="conversation-turn"]` container). The Copy button is the affirmative gate — the turn-action toolbar only renders after the turn is finalized. The text-stable + no-Stop heuristic alone false-positives on Pro Extended runs: the "thinking summary" panel renders text that sits stable for tens of seconds while the model continues reasoning silently, with no Stop button visible (this caused run `reframe-review-040` on 2026-04-30 to return a 228-char summary fragment after only 234s on a 236KB-prompt task). If the Copy button selector ever changes, runs will hit `--generation-timeout` (default 60min) — fail closed; patch the selector when this happens, don't loosen the gate.
 - **Anti-detection flags** (`--disable-blink-features=AutomationControlled`, dropping `--enable-automation` and `--no-sandbox`) are load-bearing. Removing them triggers ChatGPT's auth-error redirect.
 - **Extraction prefers the Copy button** via `[data-testid="copy-turn-action-button"]` (clean markdown), then `pbpaste` reads the system clipboard; falls back to `innerText` if either step fails. Result captures `extraction: "copy_button"|"innertext"` so you can audit which path won. Math, code fences, and tables are mangled under `innerText` — the fallback is only for degraded environments.
 - **Concurrent worker serialization** is a `fcntl.flock` exclusive lock on `~/.gpt-pro/browser.lock` held during the entire browser section. Required because Chrome's `SingletonLock` prevents two processes sharing a `--user-data-dir`. Kept blocking (no timeout) — agents wait their turn rather than fail-fast, which matches the queue-up-and-respond UX of the rest of the system.
@@ -70,7 +70,7 @@ Browser automation against ChatGPT violates OpenAI's terms. The user accepts the
 
 So future-Claude doesn't reflexively add it:
 
-- `async-status` completion signal — heuristic catches the same moment empirically. Wire only if the heuristic ever false-positives.
+- Network-side completion signals (`async-status`, `implicit_message_feedback`, etc.) — the DOM-side Copy-button gate covers the same moment with a simpler implementation and no race against Playwright response-event timing. Wire one only if the Copy button selector itself becomes unstable.
 - Auto-retry on errors — fail closed, surface the `run_dir`, let the user decide.
 - `launchd` keepalive — `tmux` is fine.
 - Sleep / clamshell handling beyond `caffeinate` — out of scope.

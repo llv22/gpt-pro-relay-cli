@@ -501,6 +501,29 @@ async def _paste_prompt(page, prompt_text: str) -> None:
                 pass
 
 
+async def _copy_button_present(page) -> bool:
+    """True if the latest assistant turn's post-completion Copy button is mounted.
+
+    The turn-action toolbar (copy/regenerate/share) only renders after the turn
+    is finalized — Pro Extended's mid-run "thinking summary" panel does not have
+    it. Used as the affirmative completion gate alongside text-stable + no Stop
+    button: the text-only heuristic false-positives because Pro can sit on a
+    summary string for tens of seconds while reasoning continues silently with
+    no Stop button visible.
+    """
+    try:
+        return await page.evaluate("""() => {
+            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+            const last = msgs[msgs.length - 1];
+            if (!last) return false;
+            const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
+            if (!container) return false;
+            return !!container.querySelector('[data-testid="copy-turn-action-button"]');
+        }""")
+    except Exception:
+        return False
+
+
 async def _copy_button_extract(page) -> str | None:
     """Click the last assistant message's Copy button and read system clipboard.
 
@@ -672,7 +695,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                         last_text = cur
                     if cur and (now - last_change) >= 5.0:
                         stop = await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
-                        if stop == 0:
+                        if stop == 0 and await _copy_button_present(page):
                             completed = True
                             break
                     await asyncio.sleep(1.5)
