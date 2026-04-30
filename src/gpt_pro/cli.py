@@ -156,12 +156,24 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0) -> str:
     return last
 
 
+# The Effort submenu trigger inside the chip menu. Two "Effort" buttons share
+# the same accessible name (one per model row) — disambiguation is by testid.
+# The button is rendered as a "trailing button" with Tailwind `invisible` and
+# its container is `pointer-events-none` until the parent row is hovered, so
+# Playwright's hover/click won't reach it. We bypass with a synthetic
+# HTMLElement.click() via evaluate() — Radix's submenu state is wired to the
+# click handler, not pointer events, so the synthetic click opens it cleanly.
+PRO_EFFORT_TRIGGER_TESTID = "model-switcher-gpt-5-5-pro-thinking-effort"
+
+
 async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
     """Make the composer chip read an Extended-reasoning label. Returns (ok, observed_text).
 
-    The chip is a Radix menu trigger — clicking it mounts a portal with
-    role='menu' containing role='menuitem' children. Idempotent: if the chip is
-    already on an Extended label, the menu is never opened.
+    Idempotent: if the chip already reads an Extended label we no-op. Otherwise
+    we open the chip menu, synthetically click the Pro Effort submenu trigger
+    (it's hidden behind a group-hover affordance — see PRO_EFFORT_TRIGGER_TESTID
+    docstring), then click the "Extended" leaf in the resulting submenu. The
+    submenu's leaves use role='menuitemradio' (not menuitem).
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
@@ -177,9 +189,33 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
         log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
         return False, text
 
-    # Match any menuitem whose accessible name contains "Extended" (handles both
-    # "Extended" and "Extended Pro" variants without re-patching).
-    item = page.get_by_role("menuitem", name=re.compile(EXTENDED_TOKEN))
+    trigger = page.locator(f'[data-testid="{PRO_EFFORT_TRIGGER_TESTID}"]').first
+    try:
+        await trigger.wait_for(state="attached", timeout=3000)
+        await trigger.evaluate("el => el.click()")
+    except Exception as e:
+        await page.screenshot(path=str(run_dir / "error-chip_pro_trigger.png"), full_page=True)
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="pro_effort_trigger_click_failed", exception=f"{type(e).__name__}: {e}")
+        await page.keyboard.press("Escape")
+        return False, text
+
+    try:
+        await page.wait_for_function(
+            "document.querySelectorAll('[role=\"menu\"]').length >= 2",
+            timeout=3000,
+        )
+    except Exception as e:
+        await page.screenshot(path=str(run_dir / "error-chip_submenu_open.png"), full_page=True)
+        (run_dir / "error.html").write_text(await page.content())
+        log_stage("error", reason="pro_effort_submenu_open_failed", exception=f"{type(e).__name__}: {e}")
+        await page.keyboard.press("Escape")
+        return False, text
+
+    # Scope the Extended lookup to the newest-mounted menu (the submenu we just
+    # opened). Leaves are role='menuitemradio'.
+    submenu = page.locator('[role="menu"]').last
+    item = submenu.get_by_role("menuitemradio", name=re.compile(EXTENDED_TOKEN))
     try:
         await item.first.click(timeout=5000)
     except Exception as e:
