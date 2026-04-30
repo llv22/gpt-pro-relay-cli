@@ -128,9 +128,17 @@ COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
 EXTENDED_TOKEN = "Extended"
 
 
-def is_extended_label(text: str | None) -> bool:
-    """Predicate for any chip/menuitem label that means 'Extended reasoning'."""
-    return bool(text) and EXTENDED_TOKEN in text
+def is_pro_extended_label(text: str | None) -> bool:
+    """Predicate: chip text unambiguously indicates Pro + Extended reasoning.
+
+    Requires *both* "Extended" and "Pro" tokens. The chip exposes no model-axis
+    signal beyond the visible label (no aria-label, no dataset, no hidden mirror
+    that differs from innerText), so a label of just "Extended" is ambiguous —
+    it could be Pro+Extended (truncated) or Thinking+Extended. Demanding "Pro"
+    too closes that fail-closed gap. The post-click confirmation in
+    ensure_extended_chip can be looser since we know which submenu we picked.
+    """
+    return bool(text) and EXTENDED_TOKEN in text and "Pro" in text
 
 
 SSR_CHIP_PLACEHOLDER = "Model"  # Server-rendered text before React hydrates the user's actual selection.
@@ -177,7 +185,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
-    if is_extended_label(text):
+    if is_pro_extended_label(text):
         return True, text
 
     await chip.click()
@@ -188,6 +196,13 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
         (run_dir / "error.html").write_text(await page.content())
         log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
         return False, text
+
+    # Capture the menu-count baseline so we can detect the *new* menu the
+    # trigger click mounts (avoids racing with unrelated portal menus that may
+    # already be mounted on the page).
+    baseline_menu_count = await page.evaluate(
+        "() => document.querySelectorAll('[role=\"menu\"]').length"
+    )
 
     trigger = page.locator(f'[data-testid="{PRO_EFFORT_TRIGGER_TESTID}"]').first
     try:
@@ -202,7 +217,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
 
     try:
         await page.wait_for_function(
-            "document.querySelectorAll('[role=\"menu\"]').length >= 2",
+            f"document.querySelectorAll('[role=\"menu\"]').length > {baseline_menu_count}",
             timeout=3000,
         )
     except Exception as e:
@@ -212,10 +227,12 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
         await page.keyboard.press("Escape")
         return False, text
 
-    # Scope the Extended lookup to the newest-mounted menu (the submenu we just
-    # opened). Leaves are role='menuitemradio'.
+    # Scope the Extended lookup to the newest-mounted menu (the submenu the
+    # trigger just opened). Leaves are role='menuitemradio'. Anchor the regex
+    # so future variants like "Extended+" or "Extended (beta)" don't silently
+    # match — those would be intentional product changes worth reviewing.
     submenu = page.locator('[role="menu"]').last
-    item = submenu.get_by_role("menuitemradio", name=re.compile(EXTENDED_TOKEN))
+    item = submenu.get_by_role("menuitemradio", name=re.compile(rf"^{EXTENDED_TOKEN}$"))
     try:
         await item.first.click(timeout=5000)
     except Exception as e:
@@ -225,13 +242,14 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
         await page.keyboard.press("Escape")
         return False, text
 
-    # Poll up to 5s for the chip text to update — Radix unmounts the menu and
-    # the chip re-renders with the newly selected label.
+    # Poll up to 5s for the chip text to update. The post-click confirmation is
+    # looser than the fast-path predicate: we already navigated through Pro's
+    # submenu, so any "Extended"-containing label proves the click took effect.
     deadline = time.time() + 5.0
     final_text = text
     while time.time() < deadline:
         final_text = (await chip.inner_text()).strip()
-        if is_extended_label(final_text):
+        if EXTENDED_TOKEN in final_text:
             return True, final_text
         await asyncio.sleep(0.2)
     return False, final_text
@@ -266,7 +284,7 @@ async def cmd_doctor() -> int:
         if ok:
             try:
                 chip_text = await read_composer_chip_text(page, timeout=10.0)
-                chip_status = "ok" if is_extended_label(chip_text) else f"unexpected: {chip_text!r}"
+                chip_status = "ok" if is_pro_extended_label(chip_text) else f"unexpected: {chip_text!r}"
             except Exception as e:
                 chip_status = f"failed: {type(e).__name__}: {e}"
         result = {
