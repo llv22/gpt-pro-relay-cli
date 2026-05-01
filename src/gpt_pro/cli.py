@@ -74,7 +74,15 @@ async def safe_screenshot(page, path: Path, *, timeout_ms: int = 10_000) -> None
         log_stage("screenshot_skipped", path=path.name, exception=f"{type(e).__name__}: {e}")
 
 
-async def launch_chrome_with_retry(pw, *, retries: int = 1):
+# Backoff schedule (seconds) between launch retries. Chosen empirically from
+# run ask-20260501T070205Z-call4-chunk1: two consecutive launches 1s apart
+# both lost the Browser.getWindowForTarget race, but a fresh worker 31s later
+# launched cleanly. The race window can outlast a couple of seconds, so back
+# off generously instead of hammering. Worst case ~17s of waiting.
+LAUNCH_RETRY_BACKOFF_SECS = (2.0, 5.0, 10.0)
+
+
+async def launch_chrome_with_retry(pw):
     """Launch the persistent Chrome context, retrying on a known launch race.
 
     With viewport={...} set, Playwright issues CDP `Browser.getWindowForTarget`
@@ -82,17 +90,22 @@ async def launch_chrome_with_retry(pw, *, retries: int = 1):
     Under `--remote-debugging-pipe` (Playwright's default), Chrome 147+ has a
     race where the host window isn't yet registered against the target when
     Playwright queries it, returning "Browser window not found" and aborting
-    the launch. A single retry has been observed to clear this in practice.
-    Other exceptions are re-raised immediately.
+    the launch. Retry with backoff; between attempts force-kill any Chrome
+    children still bound to the profile, since Playwright's "graceful close"
+    of the failed parent doesn't always wait for renderer/helper teardown
+    and a partially-alive process tree can poison the next attempt's window
+    registration. Other exceptions propagate immediately.
     """
-    for attempt in range(retries + 1):
+    attempts = len(LAUNCH_RETRY_BACKOFF_SECS) + 1
+    for attempt in range(attempts):
         try:
             return await pw.chromium.launch_persistent_context(**launch_kwargs())
         except Exception as e:
-            if "Browser.getWindowForTarget" not in str(e) or attempt >= retries:
+            if "Browser.getWindowForTarget" not in str(e) or attempt >= attempts - 1:
                 raise
             log_stage("launch_retry", attempt=attempt, exception=f"{type(e).__name__}: {e}")
-            await asyncio.sleep(1.0)
+            _kill_chrome_orphans()
+            await asyncio.sleep(LAUNCH_RETRY_BACKOFF_SECS[attempt])
 
 
 def _kill_chrome_orphans() -> None:
