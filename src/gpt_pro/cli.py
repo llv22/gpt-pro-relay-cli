@@ -50,6 +50,21 @@ def log_stage(stage: str, **kwargs) -> None:
     print(json.dumps(obj, separators=(",", ":")), file=sys.stderr, flush=True)
 
 
+async def safe_screenshot(page, path: Path, *, timeout_ms: int = 10_000) -> None:
+    """Best-effort diagnostic screenshot. Never propagate failure.
+
+    Screenshots are artifacts, not part of the critical path. A renderer that's
+    busy (e.g. mid-paste reflow on a large prompt) can stall page.screenshot
+    long enough to blow Playwright's default 30s timeout — this once killed an
+    otherwise-healthy run before Send was even clicked. Bail fast (10s) and let
+    the run continue; record the skip in worker.stderr for diagnostics.
+    """
+    try:
+        await page.screenshot(path=str(path), full_page=True, timeout=timeout_ms)
+    except Exception as e:
+        log_stage("screenshot_skipped", path=path.name, exception=f"{type(e).__name__}: {e}")
+
+
 def _kill_chrome_orphans() -> None:
     """Kill any stale Chrome procs still bound to our profile.
 
@@ -192,7 +207,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
     try:
         await page.wait_for_selector('[role="menu"]', timeout=5000)
     except Exception as e:
-        await page.screenshot(path=str(run_dir / "error-chip_menu_open.png"), full_page=True)
+        await safe_screenshot(page, run_dir / "error-chip_menu_open.png")
         (run_dir / "error.html").write_text(await page.content())
         log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
         return False, text
@@ -209,7 +224,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
         await trigger.wait_for(state="attached", timeout=3000)
         await trigger.evaluate("el => el.click()")
     except Exception as e:
-        await page.screenshot(path=str(run_dir / "error-chip_pro_trigger.png"), full_page=True)
+        await safe_screenshot(page, run_dir / "error-chip_pro_trigger.png")
         (run_dir / "error.html").write_text(await page.content())
         log_stage("error", reason="pro_effort_trigger_click_failed", exception=f"{type(e).__name__}: {e}")
         await page.keyboard.press("Escape")
@@ -221,7 +236,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
             timeout=3000,
         )
     except Exception as e:
-        await page.screenshot(path=str(run_dir / "error-chip_submenu_open.png"), full_page=True)
+        await safe_screenshot(page, run_dir / "error-chip_submenu_open.png")
         (run_dir / "error.html").write_text(await page.content())
         log_stage("error", reason="pro_effort_submenu_open_failed", exception=f"{type(e).__name__}: {e}")
         await page.keyboard.press("Escape")
@@ -236,7 +251,7 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
     try:
         await item.first.click(timeout=5000)
     except Exception as e:
-        await page.screenshot(path=str(run_dir / "error-chip_menuitem.png"), full_page=True)
+        await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
         (run_dir / "error.html").write_text(await page.content())
         log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
         await page.keyboard.press("Escape")
@@ -642,7 +657,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
                 await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
                 if not await wait_for_login(ctx, timeout=30.0):
-                    await page.screenshot(path=str(run_dir / "error-needs_reauth.png"), full_page=True)
+                    await safe_screenshot(page, run_dir / "error-needs_reauth.png")
                     (run_dir / "error.html").write_text(await page.content())
                     log_stage("error", reason="needs_reauth")
                     return err("needs_reauth")
@@ -650,7 +665,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
                 ok, chip_text = await ensure_extended_chip(page, run_dir=run_dir)
                 if not ok:
-                    await page.screenshot(path=str(run_dir / "error-model_select_failed.png"), full_page=True)
+                    await safe_screenshot(page, run_dir / "error-model_select_failed.png")
                     (run_dir / "error.html").write_text(await page.content())
                     log_stage("error", reason="model_select_failed", chip_text=chip_text)
                     return err("model_select_failed", {"chip_text": chip_text})
@@ -661,7 +676,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 await _paste_prompt(page, prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
 
-                await page.screenshot(path=str(run_dir / "pre-send.png"), full_page=True)
+                await safe_screenshot(page, run_dir / "pre-send.png")
                 send_btn = page.locator(
                     '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
                 ).first
@@ -678,7 +693,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 while time.time() < deadline:
                     now = time.time()
                     if now >= next_snap:
-                        await page.screenshot(path=str(run_dir / f"streaming-{snapshot_idx:03d}.png"), full_page=True)
+                        await safe_screenshot(page, run_dir / f"streaming-{snapshot_idx:03d}.png")
                         snapshot_idx += 1
                         next_snap = now + 30.0
                     try:
@@ -705,7 +720,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                     chars=len(last_text),
                     elapsed_secs=round(time.time() - send_ts, 1),
                 )
-                await page.screenshot(path=str(run_dir / "final.png"), full_page=True)
+                await safe_screenshot(page, run_dir / "final.png")
                 (run_dir / "final.html").write_text(await page.content())
 
                 extraction = "innertext"
