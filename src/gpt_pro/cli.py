@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -22,34 +23,40 @@ RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
 MAX_PROMPT_BYTES = 1_000_000
 
-CHROME_ARGS = [
+CHROME_APP = "/Applications/Google Chrome.app"
+LAUNCH_DEBUG_PORT = 19222
+
+# Chrome flags passed via /usr/bin/open. Curated subset of what Playwright
+# would normally pass via launch_persistent_context. Why the LaunchServices
+# launch: a process spawned via direct exec from a sshd-detached Popen worker
+# bypasses LaunchServices; the resulting Chrome has no app registration,
+# isn't in lsappinfo, has no Dock icon, and macOS WindowServer never gives it
+# a visible compositor surface. Routing through `open -n -a` puts Chrome in
+# the user's Aqua session with a real registered identity. Then connect via
+# CDP instead of letting Playwright re-exec Chrome.
+#
+# Load-bearing flags:
+#  - --disable-blink-features=AutomationControlled (anti-detection per CLAUDE.md)
+#  - --password-store=basic, --use-mock-keychain, --disable-features=
+#    DestroyProfileOnBrowserClose (cookie persistence per CLAUDE.local.md memory)
+#  - --window-size pins the OS window (zero-area windows = white-screen)
+CHROME_OPEN_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-blink-features=AutomationControlled",
-    # Force a real composited window. Without this the OS can hand Chrome a
-    # zero-area / occluded window, which means no layout frame is ever produced
-    # — the symptom is a white window plus every click failing with
-    # "element is outside of the viewport" and screenshots timing out.
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--disable-features=DestroyProfileOnBrowserClose,DialMediaRouteProvider,MediaRouter,Translate,HttpsUpgrades,PaintHolding",
     "--window-size=1280,800",
 ]
 
 
-def launch_kwargs() -> dict:
-    return dict(
-        user_data_dir=str(PROFILE),
-        channel="chrome",
-        headless=False,
-        # Don't let Playwright drive viewport at launch time. Setting `viewport=`
-        # makes Playwright issue Browser.getWindowForTarget + setWindowBounds
-        # during context init, which races under --remote-debugging-pipe on
-        # Chrome 147+ ("Browser window not found") and is not retryable on the
-        # second-to-tens-of-seconds scale. Instead, OS window size is pinned via
-        # --window-size, and the renderer viewport is pinned post-launch via a
-        # direct CDP Emulation.setDeviceMetricsOverride (see pin_viewport_cdp).
-        no_viewport=True,
-        args=CHROME_ARGS,
-        ignore_default_args=["--enable-automation", "--no-sandbox"],
-    )
+def _chrome_open_argv(port: int) -> list[str]:
+    return [
+        *CHROME_OPEN_ARGS,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={PROFILE}",
+    ]
 
 
 async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 800) -> None:
@@ -168,38 +175,41 @@ async def safe_screenshot(page, path: Path, *, timeout_ms: int = 10_000) -> None
         log_stage("screenshot_skipped", path=path.name, exception=f"{type(e).__name__}: {e}")
 
 
-# Backoff schedule (seconds) between launch retries. Chosen empirically from
-# run ask-20260501T070205Z-call4-chunk1: two consecutive launches 1s apart
-# both lost the Browser.getWindowForTarget race, but a fresh worker 31s later
-# launched cleanly. The race window can outlast a couple of seconds, so back
-# off generously instead of hammering. Worst case ~17s of waiting.
-LAUNCH_RETRY_BACKOFF_SECS = (2.0, 5.0, 10.0)
+async def launch_chrome(pw):
+    """Launch Chrome via LaunchServices, then connect Playwright via CDP.
 
+    Returns (browser, context). Caller must await browser.close() at end —
+    that closes Chrome cleanly and flushes the cookie/session SQLite.
 
-async def launch_chrome_with_retry(pw):
-    """Launch the persistent Chrome context, retrying on a known launch race.
-
-    With viewport={...} set, Playwright issues CDP `Browser.getWindowForTarget`
-    against the initial about:blank target during persistent-context init.
-    Under `--remote-debugging-pipe` (Playwright's default), Chrome 147+ has a
-    race where the host window isn't yet registered against the target when
-    Playwright queries it, returning "Browser window not found" and aborting
-    the launch. Retry with backoff; between attempts force-kill any Chrome
-    children still bound to the profile, since Playwright's "graceful close"
-    of the failed parent doesn't always wait for renderer/helper teardown
-    and a partially-alive process tree can poison the next attempt's window
-    registration. Other exceptions propagate immediately.
+    See CHROME_OPEN_ARGS comment for why `open -n -a` is load-bearing.
     """
-    attempts = len(LAUNCH_RETRY_BACKOFF_SECS) + 1
-    for attempt in range(attempts):
+    port = LAUNCH_DEBUG_PORT
+    argv = _chrome_open_argv(port)
+    subprocess.Popen(
+        ["/usr/bin/open", "-n", "-a", CHROME_APP, "--args", *argv],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 30
+    last_err: Exception | None = None
+    while time.time() < deadline:
         try:
-            return await pw.chromium.launch_persistent_context(**launch_kwargs())
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1).read()
+            log_stage("chrome_cdp_ready", port=port)
+            break
         except Exception as e:
-            if "Browser.getWindowForTarget" not in str(e) or attempt >= attempts - 1:
-                raise
-            log_stage("launch_retry", attempt=attempt, exception=f"{type(e).__name__}: {e}")
-            _kill_chrome_orphans()
-            await asyncio.sleep(LAUNCH_RETRY_BACKOFF_SECS[attempt])
+            last_err = e
+            await asyncio.sleep(0.3)
+    else:
+        raise RuntimeError(f"Chrome CDP not ready on port {port} after 30s: {last_err}")
+
+    browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    contexts = browser.contexts
+    if not contexts:
+        await browser.close()
+        raise RuntimeError("connect_over_cdp returned no contexts")
+    return browser, contexts[0]
 
 
 def _kill_chrome_orphans() -> None:
@@ -425,30 +435,32 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 async def cmd_doctor() -> int:
     run_dir = new_run_dir("doctor")
     async with async_playwright() as pw:
-        ctx = await launch_chrome_with_retry(pw)
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await activate_chrome_for_paint(page)
-        await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
-        await pin_viewport_cdp(ctx, page)
-        ok = await wait_for_login(ctx, timeout=30.0)
-        await page.screenshot(path=str(run_dir / "page.png"), full_page=True)
-        (run_dir / "page.html").write_text(await page.content())
-        chip_status = "skipped"
-        chip_text = None
-        if ok:
-            try:
-                chip_text = await read_composer_chip_text(page, timeout=10.0)
-                chip_status = "ok" if is_pro_extended_label(chip_text) else f"unexpected: {chip_text!r}"
-            except Exception as e:
-                chip_status = f"failed: {type(e).__name__}: {e}"
-        result = {
-            "status": "ok" if ok else "needs_reauth",
-            "url": page.url,
-            "chip": chip_status,
-            "chip_text": chip_text,
-            "run_dir": str(run_dir),
-        }
-        await ctx.close()
+        browser, ctx = await launch_chrome(pw)
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await activate_chrome_for_paint(page)
+            await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+            await pin_viewport_cdp(ctx, page)
+            ok = await wait_for_login(ctx, timeout=30.0)
+            await page.screenshot(path=str(run_dir / "page.png"), full_page=True)
+            (run_dir / "page.html").write_text(await page.content())
+            chip_status = "skipped"
+            chip_text = None
+            if ok:
+                try:
+                    chip_text = await read_composer_chip_text(page, timeout=10.0)
+                    chip_status = "ok" if is_pro_extended_label(chip_text) else f"unexpected: {chip_text!r}"
+                except Exception as e:
+                    chip_status = f"failed: {type(e).__name__}: {e}"
+            result = {
+                "status": "ok" if ok else "needs_reauth",
+                "url": page.url,
+                "chip": chip_status,
+                "chip_text": chip_text,
+                "run_dir": str(run_dir),
+            }
+        finally:
+            await browser.close()
     print(json.dumps(result, indent=2))
     return 0 if ok else 1
 
@@ -457,16 +469,18 @@ async def cmd_doctor() -> int:
 
 async def cmd_login() -> int:
     async with async_playwright() as pw:
-        ctx = await launch_chrome_with_retry(pw)
-        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await activate_chrome_for_paint(page)
-        await page.goto("https://chatgpt.com/")
-        await pin_viewport_cdp(ctx, page)
-        print(f"Chrome launched against {PROFILE}", file=sys.stderr)
-        print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
-        ok = await wait_for_login(ctx)
-        print("Login detected." if ok else "Timed out without detecting login.", file=sys.stderr)
-        await ctx.close()
+        browser, ctx = await launch_chrome(pw)
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await activate_chrome_for_paint(page)
+            await page.goto("https://chatgpt.com/")
+            await pin_viewport_cdp(ctx, page)
+            print(f"Chrome launched against {PROFILE}", file=sys.stderr)
+            print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
+            ok = await wait_for_login(ctx)
+            print("Login detected." if ok else "Timed out without detecting login.", file=sys.stderr)
+        finally:
+            await browser.close()
     return 0 if ok else 1
 
 
@@ -786,11 +800,11 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
     try:
         async with async_playwright() as pw:
-            ctx = await launch_chrome_with_retry(pw)
-            # Inner try/except/finally guarantees ctx.close() runs while Chrome
-            # is still alive — clean shutdown flushes the cookie/session SQLite.
-            # Worker-exception screenshots also live inside the inner try so
-            # they're captured before ctx is torn down.
+            browser, ctx = await launch_chrome(pw)
+            # Inner try/except/finally guarantees browser.close() runs while
+            # Chrome is still alive — clean shutdown flushes cookie/session
+            # SQLite. Worker-exception screenshots also live inside the inner
+            # try so they're captured before Chrome is torn down.
             try:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 await activate_chrome_for_paint(page)
@@ -897,7 +911,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 return worker_exception_result(e)
             finally:
                 try:
-                    await ctx.close()
+                    await browser.close()
                 except Exception:
                     pass
     except Exception as e:
