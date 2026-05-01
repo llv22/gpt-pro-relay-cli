@@ -60,11 +60,21 @@ async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 80
     getBoundingClientRect / window.innerWidth track our pinned viewport, so
     Playwright's "outside of viewport" clickability check stays accurate even
     if the OS window state ever drifts.
+
+    Call this only AFTER a real navigation. The initial about:blank target in a
+    persistent context rejects setDeviceMetricsOverride with "Target does not
+    support metrics override" (observed on Chrome 147 + persistent profile).
+    Best-effort: log and continue on failure rather than killing the run —
+    the OS-level --window-size still gives the renderer a sane default, and
+    the override is belt-and-suspenders for unstable window states.
     """
-    cdp = await context.new_cdp_session(page)
-    await cdp.send("Emulation.setDeviceMetricsOverride", {
-        "width": width, "height": height, "deviceScaleFactor": 1, "mobile": False,
-    })
+    try:
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("Emulation.setDeviceMetricsOverride", {
+            "width": width, "height": height, "deviceScaleFactor": 1, "mobile": False,
+        })
+    except Exception as e:
+        log_stage("pin_viewport_skipped", exception=f"{type(e).__name__}: {e}")
 
 
 def stderr_jsonl(obj: dict) -> None:
@@ -351,8 +361,8 @@ async def cmd_doctor() -> int:
     async with async_playwright() as pw:
         ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await pin_viewport_cdp(ctx, page)
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+        await pin_viewport_cdp(ctx, page)
         ok = await wait_for_login(ctx, timeout=30.0)
         await page.screenshot(path=str(run_dir / "page.png"), full_page=True)
         (run_dir / "page.html").write_text(await page.content())
@@ -382,8 +392,8 @@ async def cmd_login() -> int:
     async with async_playwright() as pw:
         ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-        await pin_viewport_cdp(ctx, page)
         await page.goto("https://chatgpt.com/")
+        await pin_viewport_cdp(ctx, page)
         print(f"Chrome launched against {PROFILE}", file=sys.stderr)
         print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
         ok = await wait_for_login(ctx)
@@ -715,11 +725,11 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
             # they're captured before ctx is torn down.
             try:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                await pin_viewport_cdp(ctx, page)
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
                 log_stage("chrome_launched")
 
                 await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+                await pin_viewport_cdp(ctx, page)
                 if not await wait_for_login(ctx, timeout=30.0):
                     await safe_screenshot(page, run_dir / "error-needs_reauth.png")
                     (run_dir / "error.html").write_text(await page.content())
