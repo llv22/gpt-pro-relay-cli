@@ -74,6 +74,27 @@ async def safe_screenshot(page, path: Path, *, timeout_ms: int = 10_000) -> None
         log_stage("screenshot_skipped", path=path.name, exception=f"{type(e).__name__}: {e}")
 
 
+async def launch_chrome_with_retry(pw, *, retries: int = 1):
+    """Launch the persistent Chrome context, retrying on a known launch race.
+
+    With viewport={...} set, Playwright issues CDP `Browser.getWindowForTarget`
+    against the initial about:blank target during persistent-context init.
+    Under `--remote-debugging-pipe` (Playwright's default), Chrome 147+ has a
+    race where the host window isn't yet registered against the target when
+    Playwright queries it, returning "Browser window not found" and aborting
+    the launch. A single retry has been observed to clear this in practice.
+    Other exceptions are re-raised immediately.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return await pw.chromium.launch_persistent_context(**launch_kwargs())
+        except Exception as e:
+            if "Browser.getWindowForTarget" not in str(e) or attempt >= retries:
+                raise
+            log_stage("launch_retry", attempt=attempt, exception=f"{type(e).__name__}: {e}")
+            await asyncio.sleep(1.0)
+
+
 def _kill_chrome_orphans() -> None:
     """Kill any stale Chrome procs still bound to our profile.
 
@@ -297,7 +318,7 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 async def cmd_doctor() -> int:
     run_dir = new_run_dir("doctor")
     async with async_playwright() as pw:
-        ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
+        ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
         ok = await wait_for_login(ctx, timeout=30.0)
@@ -327,7 +348,7 @@ async def cmd_doctor() -> int:
 
 async def cmd_login() -> int:
     async with async_playwright() as pw:
-        ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
+        ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await page.goto("https://chatgpt.com/")
         print(f"Chrome launched against {PROFILE}", file=sys.stderr)
@@ -654,7 +675,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
     try:
         async with async_playwright() as pw:
-            ctx = await pw.chromium.launch_persistent_context(**launch_kwargs())
+            ctx = await launch_chrome_with_retry(pw)
             # Inner try/except/finally guarantees ctx.close() runs while Chrome
             # is still alive — clean shutdown flushes the cookie/session SQLite.
             # Worker-exception screenshots also live inside the inner try so
