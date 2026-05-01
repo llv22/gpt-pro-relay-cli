@@ -39,14 +39,32 @@ def launch_kwargs() -> dict:
         user_data_dir=str(PROFILE),
         channel="chrome",
         headless=False,
-        # Pin the viewport via CDP Emulation.setDeviceMetricsOverride. With the
-        # previous `no_viewport=True`, Playwright deferred to the OS window
-        # geometry, so a misbehaving window state cascaded into bogus
-        # getBoundingClientRect values and "outside of the viewport" clicks.
-        viewport={"width": 1280, "height": 800},
+        # Don't let Playwright drive viewport at launch time. Setting `viewport=`
+        # makes Playwright issue Browser.getWindowForTarget + setWindowBounds
+        # during context init, which races under --remote-debugging-pipe on
+        # Chrome 147+ ("Browser window not found") and is not retryable on the
+        # second-to-tens-of-seconds scale. Instead, OS window size is pinned via
+        # --window-size, and the renderer viewport is pinned post-launch via a
+        # direct CDP Emulation.setDeviceMetricsOverride (see pin_viewport_cdp).
+        no_viewport=True,
         args=CHROME_ARGS,
         ignore_default_args=["--enable-automation", "--no-sandbox"],
     )
+
+
+async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 800) -> None:
+    """Pin renderer viewport via direct CDP, bypassing the racy launch-time path.
+
+    setDeviceMetricsOverride only affects renderer-level emulation — no
+    Browser.getWindowForTarget call, no window-bounds dance, no race. Result:
+    getBoundingClientRect / window.innerWidth track our pinned viewport, so
+    Playwright's "outside of viewport" clickability check stays accurate even
+    if the OS window state ever drifts.
+    """
+    cdp = await context.new_cdp_session(page)
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+        "width": width, "height": height, "deviceScaleFactor": 1, "mobile": False,
+    })
 
 
 def stderr_jsonl(obj: dict) -> None:
@@ -333,6 +351,7 @@ async def cmd_doctor() -> int:
     async with async_playwright() as pw:
         ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await pin_viewport_cdp(ctx, page)
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
         ok = await wait_for_login(ctx, timeout=30.0)
         await page.screenshot(path=str(run_dir / "page.png"), full_page=True)
@@ -363,6 +382,7 @@ async def cmd_login() -> int:
     async with async_playwright() as pw:
         ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await pin_viewport_cdp(ctx, page)
         await page.goto("https://chatgpt.com/")
         print(f"Chrome launched against {PROFILE}", file=sys.stderr)
         print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
@@ -695,6 +715,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
             # they're captured before ctx is torn down.
             try:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await pin_viewport_cdp(ctx, page)
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
                 log_stage("chrome_launched")
 
