@@ -77,6 +77,28 @@ async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 80
         log_stage("pin_viewport_skipped", exception=f"{type(e).__name__}: {e}")
 
 
+def _find_chrome_browser_pid() -> int | None:
+    """Return the PID of the gpt-pro Chrome BROWSER process — the parent that
+    owns the Cocoa window. Helper/renderer processes carry --type= in argv and
+    don't own windows; activating them is a no-op.
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-fl", f"user-data-dir={PROFILE}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        try:
+            pid_str, cmd = line.split(maxsplit=1)
+        except ValueError:
+            continue
+        if "--type=" not in cmd:
+            return int(pid_str)
+    return None
+
+
 async def activate_chrome_for_paint(page) -> None:
     """Force Chrome's window onto a real CoreAnimation compositor surface.
 
@@ -87,21 +109,34 @@ async def activate_chrome_for_paint(page) -> None:
     CA surface. DOM, CDP, and clicks keep working — but Page.captureScreenshot
     waits forever for a frame, and a human watcher sees a white window.
 
-    `open -b com.google.Chrome` performs LaunchServices activation in the
-    logged-in user's Aqua session; `page.bring_to_front()` focuses the
-    automation target so the first navigation creates a visible surface.
-    Best-effort — never fail the run on activation issues.
+    PID-targeted activation: a bundle-wide `open -b com.google.Chrome` is
+    ambiguous when the user has another Chrome running (interactive +
+    gpt-pro share the bundle but are separate processes). Resolve the gpt-pro
+    Chrome browser PID via pgrep, then activate that specific NSRunningApplication
+    via JXA — `NSRunningApplication.activateWithOptions:` doesn't need
+    Accessibility permission and won't get redirected to the wrong instance.
+    Then `page.bring_to_front()` focuses the automation target so the first
+    navigation creates a visible surface. Best-effort.
     """
     if sys.platform == "darwin":
-        try:
-            subprocess.run(
-                ["/usr/bin/open", "-b", "com.google.Chrome"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5, check=True,
+        pid = _find_chrome_browser_pid()
+        if pid is None:
+            log_stage("chrome_activation_skipped", reason="browser_pid_not_found")
+        else:
+            jxa = (
+                'ObjC.import("AppKit");'
+                f'$.NSRunningApplication.runningApplicationWithProcessIdentifier({pid})'
+                '.activateWithOptions(2);'
             )
-            log_stage("chrome_activated")
-        except Exception as e:
-            log_stage("chrome_activation_skipped", exception=f"{type(e).__name__}: {e}")
+            try:
+                subprocess.run(
+                    ["/usr/bin/osascript", "-l", "JavaScript", "-e", jxa],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5, check=True,
+                )
+                log_stage("chrome_activated", pid=pid)
+            except Exception as e:
+                log_stage("chrome_activation_skipped", exception=f"{type(e).__name__}: {e}")
     try:
         await page.bring_to_front()
     except Exception as e:
