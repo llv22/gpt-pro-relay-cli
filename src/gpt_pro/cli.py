@@ -26,6 +26,11 @@ CHROME_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-blink-features=AutomationControlled",
+    # Force a real composited window. Without this the OS can hand Chrome a
+    # zero-area / occluded window, which means no layout frame is ever produced
+    # — the symptom is a white window plus every click failing with
+    # "element is outside of the viewport" and screenshots timing out.
+    "--window-size=1280,800",
 ]
 
 
@@ -34,7 +39,11 @@ def launch_kwargs() -> dict:
         user_data_dir=str(PROFILE),
         channel="chrome",
         headless=False,
-        no_viewport=True,
+        # Pin the viewport via CDP Emulation.setDeviceMetricsOverride. With the
+        # previous `no_viewport=True`, Playwright deferred to the OS window
+        # geometry, so a misbehaving window state cascaded into bogus
+        # getBoundingClientRect values and "outside of the viewport" clicks.
+        viewport={"width": 1280, "height": 800},
         args=CHROME_ARGS,
         ignore_default_args=["--enable-automation", "--no-sandbox"],
     )
