@@ -34,6 +34,11 @@ RUN_ID="ask-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<'PROMPT'
 ... the prompt ...
 PROMPT
+submit_rc=$?
+if (( submit_rc != 0 )); then
+  echo "gpt-pro-relay Phase 1 submit failed (rc=$submit_rc); skipping fetch loop. Safe to retry with the same RUN_ID — same prompt bytes attach idempotently." >&2
+  exit "$submit_rc"
+fi
 
 # Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
 deadline=$((SECONDS + 3600)); delay=5
