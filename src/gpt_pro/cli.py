@@ -77,6 +77,37 @@ async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 80
         log_stage("pin_viewport_skipped", exception=f"{type(e).__name__}: {e}")
 
 
+async def activate_chrome_for_paint(page) -> None:
+    """Force Chrome's window onto a real CoreAnimation compositor surface.
+
+    Chrome on macOS displays web content via a BrowserCompositorCALayerTree
+    attached to the Cocoa view. When the worker is launched from a detached
+    Popen (sshd → start_new_session=True → no AppKit activation), Chrome can
+    skip the LaunchServices/AppKit foreground path and never bind a visible
+    CA surface. DOM, CDP, and clicks keep working — but Page.captureScreenshot
+    waits forever for a frame, and a human watcher sees a white window.
+
+    `open -b com.google.Chrome` performs LaunchServices activation in the
+    logged-in user's Aqua session; `page.bring_to_front()` focuses the
+    automation target so the first navigation creates a visible surface.
+    Best-effort — never fail the run on activation issues.
+    """
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["/usr/bin/open", "-b", "com.google.Chrome"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=True,
+            )
+            log_stage("chrome_activated")
+        except Exception as e:
+            log_stage("chrome_activation_skipped", exception=f"{type(e).__name__}: {e}")
+    try:
+        await page.bring_to_front()
+    except Exception as e:
+        log_stage("page_bring_to_front_skipped", exception=f"{type(e).__name__}: {e}")
+
+
 def stderr_jsonl(obj: dict) -> None:
     print(json.dumps(obj, separators=(",", ":")), file=sys.stderr, flush=True)
 
@@ -361,6 +392,7 @@ async def cmd_doctor() -> int:
     async with async_playwright() as pw:
         ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await activate_chrome_for_paint(page)
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
         await pin_viewport_cdp(ctx, page)
         ok = await wait_for_login(ctx, timeout=30.0)
@@ -392,6 +424,7 @@ async def cmd_login() -> int:
     async with async_playwright() as pw:
         ctx = await launch_chrome_with_retry(pw)
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await activate_chrome_for_paint(page)
         await page.goto("https://chatgpt.com/")
         await pin_viewport_cdp(ctx, page)
         print(f"Chrome launched against {PROFILE}", file=sys.stderr)
@@ -725,6 +758,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
             # they're captured before ctx is torn down.
             try:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await activate_chrome_for_paint(page)
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
                 log_stage("chrome_launched")
 
