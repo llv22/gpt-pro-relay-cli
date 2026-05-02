@@ -175,11 +175,49 @@ async def safe_screenshot(page, path: Path, *, timeout_ms: int = 10_000) -> None
         log_stage("screenshot_skipped", path=path.name, exception=f"{type(e).__name__}: {e}")
 
 
+async def _pick_windowed_page(ctx):
+    """Return a page backed by a real OS window.
+
+    Chrome launched via `open -n -a` against a persistent --user-data-dir can
+    surface multiple targets in `ctx.pages`: the new tab Chrome creates at
+    startup (windowed), session-restored tabs from the prior run (deserialized
+    as targets with no associated window — no compositor surface, so
+    `Page.captureScreenshot` hangs forever waiting for a paint frame), and
+    auxiliary chrome:// UI pages like the omnibox popup (also windowless).
+
+    Without this picker, `ctx.pages[0]` deterministically lands on the first
+    listed page — often the windowless restored tab — and every screenshot
+    times out while DOM/CDP/input keep working. Confirmed via CDP
+    `Browser.getWindowForTarget` returning "Browser window not found" for the
+    restored chatgpt.com tab while the new-tab page returns valid bounds.
+
+    Don't try to close the phantoms: chrome:// auxiliary pages (omnibox
+    popups) reject `page.close()` and hang the call. The phantoms are harmless
+    as long as we never select one — a subsequent `page.goto()` on the
+    windowed page replaces its URL, and the orphaned restored tab stays in
+    the background until `browser.close()`.
+    """
+    if not ctx.pages:
+        return await ctx.new_page()
+    for page in ctx.pages:
+        try:
+            sess = await ctx.new_cdp_session(page)
+            tid = (await sess.send("Target.getTargetInfo"))["targetInfo"]["targetId"]
+            await sess.send("Browser.getWindowForTarget", {"targetId": tid})
+            return page
+        except Exception:
+            continue
+    log_stage("pick_windowed_page_fallback", reason="no_window_found", pages=len(ctx.pages))
+    return await ctx.new_page()
+
+
 async def launch_chrome(pw):
     """Launch Chrome via LaunchServices, then connect Playwright via CDP.
 
-    Returns (browser, context). Caller must await browser.close() at end —
-    that closes Chrome cleanly and flushes the cookie/session SQLite.
+    Returns (browser, context, page). The returned page is guaranteed to be
+    backed by a real OS window — see _pick_windowed_page for why this matters.
+    Caller must await browser.close() at end — that closes Chrome cleanly and
+    flushes the cookie/session SQLite.
 
     See CHROME_OPEN_ARGS comment for why `open -n -a` is load-bearing.
     """
@@ -209,7 +247,9 @@ async def launch_chrome(pw):
     if not contexts:
         await browser.close()
         raise RuntimeError("connect_over_cdp returned no contexts")
-    return browser, contexts[0]
+    ctx = contexts[0]
+    page = await _pick_windowed_page(ctx)
+    return browser, ctx, page
 
 
 def _kill_chrome_orphans() -> None:
@@ -435,9 +475,8 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 async def cmd_doctor() -> int:
     run_dir = new_run_dir("doctor")
     async with async_playwright() as pw:
-        browser, ctx = await launch_chrome(pw)
+        browser, ctx, page = await launch_chrome(pw)
         try:
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await activate_chrome_for_paint(page)
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             await pin_viewport_cdp(ctx, page)
@@ -469,9 +508,8 @@ async def cmd_doctor() -> int:
 
 async def cmd_login() -> int:
     async with async_playwright() as pw:
-        browser, ctx = await launch_chrome(pw)
+        browser, ctx, page = await launch_chrome(pw)
         try:
-            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await activate_chrome_for_paint(page)
             await page.goto("https://chatgpt.com/")
             await pin_viewport_cdp(ctx, page)
@@ -800,13 +838,12 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
 
     try:
         async with async_playwright() as pw:
-            browser, ctx = await launch_chrome(pw)
+            browser, ctx, page = await launch_chrome(pw)
             # Inner try/except/finally guarantees browser.close() runs while
             # Chrome is still alive — clean shutdown flushes cookie/session
             # SQLite. Worker-exception screenshots also live inside the inner
             # try so they're captured before Chrome is torn down.
             try:
-                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 await activate_chrome_for_paint(page)
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
                 log_stage("chrome_launched")
