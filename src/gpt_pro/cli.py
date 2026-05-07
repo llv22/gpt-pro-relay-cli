@@ -16,15 +16,32 @@ from playwright.async_api import async_playwright
 PROFILE = Path.home() / ".gpt-pro-profile"
 STATE = Path.home() / ".gpt-pro"
 RUNS = STATE / "runs"
-BROWSER_LOCK = STATE / "browser.lock"
+LAUNCH_LOCK = STATE / "launch.lock"
+CLIPBOARD_LOCK = STATE / "clipboard.lock"
+SLOT_LOCK_DIR = STATE / "slots"
 SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
+DEFAULT_MAX_PARALLEL = 3
 MAX_PROMPT_BYTES = 1_000_000
 
 CHROME_APP = "/Applications/Google Chrome.app"
 LAUNCH_DEBUG_PORT = 19222
+
+
+MAX_PARALLEL_CEILING = 10  # Personal-use ceiling per CLAUDE.md / README.md.
+
+
+def get_max_parallel() -> int:
+    try:
+        n = int(os.environ.get("GPT_PRO_MAX_PARALLEL", DEFAULT_MAX_PARALLEL))
+    except ValueError:
+        n = DEFAULT_MAX_PARALLEL
+    clamped = min(MAX_PARALLEL_CEILING, max(1, n))
+    if clamped != n:
+        log_stage("max_parallel_clamped", requested=n, effective=clamped, ceiling=MAX_PARALLEL_CEILING)
+    return clamped
 
 # Chrome flags passed via /usr/bin/open. Curated subset of what Playwright
 # would normally pass via launch_persistent_context. Why the LaunchServices
@@ -106,44 +123,52 @@ def _find_chrome_browser_pid() -> int | None:
     return None
 
 
-async def activate_chrome_for_paint(page) -> None:
-    """Force Chrome's window onto a real CoreAnimation compositor surface.
+def bind_chrome_compositor_surface() -> None:
+    """JXA-activate the gpt-pro Chrome process to bind its CoreAnimation surface.
 
     Chrome on macOS displays web content via a BrowserCompositorCALayerTree
     attached to the Cocoa view. When the worker is launched from a detached
     Popen (sshd → start_new_session=True → no AppKit activation), Chrome can
-    skip the LaunchServices/AppKit foreground path and never bind a visible
-    CA surface. DOM, CDP, and clicks keep working — but Page.captureScreenshot
+    skip the LaunchServices/AppKit foreground path and never bind a visible CA
+    surface. DOM, CDP, and clicks keep working — but Page.captureScreenshot
     waits forever for a frame, and a human watcher sees a white window.
 
-    PID-targeted activation: a bundle-wide `open -b com.google.Chrome` is
-    ambiguous when the user has another Chrome running (interactive +
-    gpt-pro share the bundle but are separate processes). Resolve the gpt-pro
-    Chrome browser PID via pgrep, then activate that specific NSRunningApplication
-    via JXA — `NSRunningApplication.activateWithOptions:` doesn't need
-    Accessibility permission and won't get redirected to the wrong instance.
-    Then `page.bring_to_front()` focuses the automation target so the first
-    navigation creates a visible surface. Best-effort.
+    PID-targeted activation via NSRunningApplication.activateWithOptions: avoids
+    bundle ambiguity (interactive Chrome + gpt-pro Chrome share the bundle) and
+    needs no Accessibility permission. Idempotent: if Chrome is already
+    foreground the JXA call is a no-op. Does NOT call page.bring_to_front, so
+    a concurrent worker mid-paste in another tab is not disturbed. Safe to
+    call from anywhere; cheap when not needed.
     """
-    if sys.platform == "darwin":
-        pid = _find_chrome_browser_pid()
-        if pid is None:
-            log_stage("chrome_activation_skipped", reason="browser_pid_not_found")
-        else:
-            jxa = (
-                'ObjC.import("AppKit");'
-                f'$.NSRunningApplication.runningApplicationWithProcessIdentifier({pid})'
-                '.activateWithOptions(2);'
-            )
-            try:
-                subprocess.run(
-                    ["/usr/bin/osascript", "-l", "JavaScript", "-e", jxa],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=5, check=True,
-                )
-                log_stage("chrome_activated", pid=pid)
-            except Exception as e:
-                log_stage("chrome_activation_skipped", exception=f"{type(e).__name__}: {e}")
+    if sys.platform != "darwin":
+        return
+    pid = _find_chrome_browser_pid()
+    if pid is None:
+        log_stage("chrome_activation_skipped", reason="browser_pid_not_found")
+        return
+    jxa = (
+        'ObjC.import("AppKit");'
+        f'$.NSRunningApplication.runningApplicationWithProcessIdentifier({pid})'
+        '.activateWithOptions(2);'
+    )
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-l", "JavaScript", "-e", jxa],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=True,
+        )
+        log_stage("chrome_activated", pid=pid)
+    except Exception as e:
+        log_stage("chrome_activation_skipped", exception=f"{type(e).__name__}: {e}")
+
+
+async def bring_tab_to_front(page) -> None:
+    """page.bring_to_front() — switches Chrome's active tab to this worker's page.
+
+    UNSAFE outside UiClipboardLock: another worker mid-paste expects its tab
+    to stay frontmost so its `Meta+V` lands in its composer. Only call from
+    within the focus+paste / focus+copy critical sections that hold the lock.
+    """
     try:
         await page.bring_to_front()
     except Exception as e:
@@ -175,81 +200,124 @@ async def safe_screenshot(page, path: Path, *, timeout_ms: int = 10_000) -> None
         log_stage("screenshot_skipped", path=path.name, exception=f"{type(e).__name__}: {e}")
 
 
-async def _pick_windowed_page(ctx):
-    """Return a page backed by a real OS window.
+def probe_cdp(port: int, *, timeout: float = 1.0) -> bool:
+    """True if Chrome's CDP endpoint at the given port responds within `timeout`s.
 
-    Chrome launched via `open -n -a` against a persistent --user-data-dir can
-    surface multiple targets in `ctx.pages`: the new tab Chrome creates at
-    startup (windowed), session-restored tabs from the prior run (deserialized
-    as targets with no associated window — no compositor surface, so
-    `Page.captureScreenshot` hangs forever waiting for a paint frame), and
-    auxiliary chrome:// UI pages like the omnibox popup (also windowless).
-
-    Without this picker, `ctx.pages[0]` deterministically lands on the first
-    listed page — often the windowless restored tab — and every screenshot
-    times out while DOM/CDP/input keep working. Confirmed via CDP
-    `Browser.getWindowForTarget` returning "Browser window not found" for the
-    restored chatgpt.com tab while the new-tab page returns valid bounds.
-
-    Don't try to close the phantoms: chrome:// auxiliary pages (omnibox
-    popups) reject `page.close()` and hang the call. The phantoms are harmless
-    as long as we never select one — a subsequent `page.goto()` on the
-    windowed page replaces its URL, and the orphaned restored tab stays in
-    the background until `browser.close()`.
+    The default 1s is for the fast-path (everything's healthy and the request
+    returns instantly). Use a longer timeout (e.g. 3s) inside LaunchLock when
+    deciding whether to kill processes — under heavy CPU contention from
+    multiple in-flight Pro Extended renderers, a healthy Chrome can take >1s
+    to respond and we don't want to falsely declare it orphaned.
     """
-    if not ctx.pages:
-        return await ctx.new_page()
-    for page in ctx.pages:
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout).read()
+        return True
+    except Exception:
+        return False
+
+
+def _slots_held() -> bool:
+    """True if any other worker currently holds a ParallelSlot lock.
+
+    Probes each slot file with non-blocking LOCK_EX. If a slot is held by
+    another process, our LOCK_EX fails with BlockingIOError. We only care
+    about *other* workers, not ourselves — when called from inside our own
+    ParallelSlot, our own slot will fail this check too. Callers that need
+    to distinguish "any slot held" from "any *other* slot held" should pass
+    their own slot id to skip; for now we treat any held slot as workers-active
+    since the kill-orphans path is invoked from contexts that don't hold a slot.
+    """
+    if not SLOT_LOCK_DIR.exists():
+        return False
+    for path in SLOT_LOCK_DIR.glob("slot-*.lock"):
         try:
-            sess = await ctx.new_cdp_session(page)
-            tid = (await sess.send("Target.getTargetInfo"))["targetInfo"]["targetId"]
-            await sess.send("Browser.getWindowForTarget", {"targetId": tid})
-            return page
-        except Exception:
+            fd = open(path, "w")
+        except OSError:
             continue
-    log_stage("pick_windowed_page_fallback", reason="no_window_found", pages=len(ctx.pages))
-    return await ctx.new_page()
-
-
-async def launch_chrome(pw):
-    """Launch Chrome via LaunchServices, then connect Playwright via CDP.
-
-    Returns (browser, context, page). The returned page is guaranteed to be
-    backed by a real OS window — see _pick_windowed_page for why this matters.
-    Caller must await browser.close() at end — that closes Chrome cleanly and
-    flushes the cookie/session SQLite.
-
-    See CHROME_OPEN_ARGS comment for why `open -n -a` is load-bearing.
-    """
-    port = LAUNCH_DEBUG_PORT
-    argv = _chrome_open_argv(port)
-    subprocess.Popen(
-        ["/usr/bin/open", "-n", "-a", CHROME_APP, "--args", *argv],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.time() + 30
-    last_err: Exception | None = None
-    while time.time() < deadline:
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1).read()
-            log_stage("chrome_cdp_ready", port=port)
-            break
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(0.3)
-    else:
-        raise RuntimeError(f"Chrome CDP not ready on port {port} after 30s: {last_err}")
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            fd.close()
+    return False
 
-    browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-    contexts = browser.contexts
-    if not contexts:
-        await browser.close()
-        raise RuntimeError("connect_over_cdp returned no contexts")
-    ctx = contexts[0]
-    page = await _pick_windowed_page(ctx)
-    return browser, ctx, page
+
+def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT) -> bool:
+    """Idempotent: launch Chrome bound to PROFILE if its CDP isn't responding.
+
+    Returns True iff this call performed the launch (the "owner" return), False if
+    it found Chrome already up. Holds LaunchLock only across the launch path; the
+    fast-path (CDP up) does not contend.
+
+    Kill-orphan safety: under heavy load a healthy Chrome can fail a 1s probe.
+    Inside LaunchLock we re-probe with a 3s timeout and one retry, AND we refuse
+    to kill if any other worker is currently holding a ParallelSlot (i.e., has
+    a live tab in the same Chrome). The combination prevents the "transient CDP
+    stall under load → kill the live Chrome" failure mode.
+
+    On the launch path, also bind the CoreAnimation surface once. Followers
+    don't need to bind — Chrome's compositor stays bound for the rest of its
+    lifetime once activated.
+    """
+    if probe_cdp(port):
+        return False
+    with LaunchLock():
+        # Re-probe with a longer timeout — under contention the 1s fast-path
+        # probe can falsely fail. Two retries with 0.5s backoff.
+        for _ in range(2):
+            if probe_cdp(port, timeout=3.0):
+                return False
+            time.sleep(0.5)
+        # CDP is genuinely unresponsive. Refuse to kill if other workers are
+        # using the shared Chrome — they'd lose their tabs. Surface a clear
+        # error for the operator.
+        if _slots_held():
+            raise RuntimeError(
+                "Chrome CDP unresponsive but other workers hold ParallelSlots; "
+                "refusing to kill shared Chrome. Wait for active runs to finish, "
+                "then run `gpt-pro-relay close-chrome --force` if Chrome is wedged."
+            )
+        _kill_chrome_orphans()
+        argv = _chrome_open_argv(port)
+        subprocess.Popen(
+            ["/usr/bin/open", "-n", "-a", CHROME_APP, "--args", *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if probe_cdp(port):
+                log_stage("chrome_cdp_ready", port=port)
+                bind_chrome_compositor_surface()
+                return True
+            time.sleep(0.3)
+        raise RuntimeError(f"Chrome CDP not ready on port {port} after 30s")
+
+
+async def connect_shared_chrome(pw, port: int = LAUNCH_DEBUG_PORT):
+    """Connect Playwright to the running Chrome via CDP. Returns the persistent context.
+
+    Caller is responsible for `ctx.new_page()` per worker tab and `page.close()`
+    on exit. The returned context's owning browser handle is intentionally NOT
+    surfaced — callers must NOT call `browser.close()`, and Playwright's `async
+    with` exit drops the connection without terminating Chrome.
+
+    Retries briefly on empty `browser.contexts`: just-launched Chrome's
+    persistent default context can lag the CDP `/json/version` ready signal by
+    a few hundred ms under contention.
+    """
+    deadline = time.time() + 5.0
+    while True:
+        browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        if browser.contexts:
+            return browser.contexts[0]
+        if time.time() >= deadline:
+            raise RuntimeError("connect_over_cdp returned no contexts after 5s")
+        await asyncio.sleep(0.25)
 
 
 def _kill_chrome_orphans() -> None:
@@ -319,13 +387,14 @@ async def is_logged_in(ctx) -> bool:
     return any(c["name"].startswith(SESSION_COOKIE_PREFIX) for c in cookies)
 
 
-# Composer chip combines model + reasoning. Extended reasoning is gated to Pro
-# models, so any label containing "Extended" verifies both axes — same fail-closed
-# guarantee as the old (model picker + reasoning chip) pair. We match by predicate
-# rather than exact string because ChatGPT renders this label inconsistently:
-# observed values include "Extended" and "Extended Pro" (varies with A/B tests
-# and/or the chip's responsive truncation classes — `max-w-40 truncate` and
-# `[[data-collapse-labels]_&]:sr-only`). Either is correct.
+# Composer chip combines model + reasoning. The chip exposes no model-axis
+# signal beyond the visible label (no aria-label, no dataset, no hidden mirror
+# that differs from innerText), so a label of just "Extended" is ambiguous —
+# it could be Pro+Extended (truncated) or Thinking+Extended. We require *both*
+# "Extended" and "Pro" in the text (see `is_pro_extended_label`). Observed
+# label variants: "Extended", "Extended Pro" — the truncation flips with A/B
+# tests and the chip's responsive classes (`max-w-40 truncate`,
+# `[[data-collapse-labels]_&]:sr-only`).
 COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
 EXTENDED_TOKEN = "Extended"
 
@@ -379,82 +448,92 @@ PRO_EFFORT_TRIGGER_TESTID = "model-switcher-gpt-5-5-pro-thinking-effort"
 async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
     """Make the composer chip read an Extended-reasoning label. Returns (ok, observed_text).
 
-    Idempotent: if the chip already reads an Extended label we no-op. Otherwise
-    we open the chip menu, synthetically click the Pro Effort submenu trigger
-    (it's hidden behind a group-hover affordance — see PRO_EFFORT_TRIGGER_TESTID
-    docstring), then click the "Extended" leaf in the resulting submenu. The
-    submenu's leaves use role='menuitemradio' (not menuitem).
+    Idempotent fast path: if the chip already reads `is_pro_extended_label`
+    we no-op without taking any lock — the typical case.
+
+    Slow path (chip in a wrong state): held under `UiClipboardLock` plus a
+    `bring_tab_to_front` because the chip menu and its submenu are focus-
+    sensitive Radix portals, and `keyboard.press("Escape")` on cleanup paths
+    can close the wrong menu if a concurrent worker brings its tab to front.
+    The slow path opens the chip menu, synthetically clicks the Pro Effort
+    submenu trigger (hidden behind a group-hover affordance — see
+    PRO_EFFORT_TRIGGER_TESTID docstring), then clicks the "Extended" leaf
+    (role='menuitemradio', not menuitem).
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
     if is_pro_extended_label(text):
         return True, text
 
-    await chip.click()
-    try:
-        await page.wait_for_selector('[role="menu"]', timeout=5000)
-    except Exception as e:
-        await safe_screenshot(page, run_dir / "error-chip_menu_open.png")
-        (run_dir / "error.html").write_text(await page.content())
-        log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
-        return False, text
+    with UiClipboardLock():
+        bind_chrome_compositor_surface()
+        await bring_tab_to_front(page)
 
-    # Capture the menu-count baseline so we can detect the *new* menu the
-    # trigger click mounts (avoids racing with unrelated portal menus that may
-    # already be mounted on the page).
-    baseline_menu_count = await page.evaluate(
-        "() => document.querySelectorAll('[role=\"menu\"]').length"
-    )
+        await chip.click()
+        try:
+            await page.wait_for_selector('[role="menu"]', timeout=5000)
+        except Exception as e:
+            await safe_screenshot(page, run_dir / "error-chip_menu_open.png")
+            (run_dir / "error.html").write_text(await page.content())
+            log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
+            return False, text
 
-    trigger = page.locator(f'[data-testid="{PRO_EFFORT_TRIGGER_TESTID}"]').first
-    try:
-        await trigger.wait_for(state="attached", timeout=3000)
-        await trigger.evaluate("el => el.click()")
-    except Exception as e:
-        await safe_screenshot(page, run_dir / "error-chip_pro_trigger.png")
-        (run_dir / "error.html").write_text(await page.content())
-        log_stage("error", reason="pro_effort_trigger_click_failed", exception=f"{type(e).__name__}: {e}")
-        await page.keyboard.press("Escape")
-        return False, text
-
-    try:
-        await page.wait_for_function(
-            f"document.querySelectorAll('[role=\"menu\"]').length > {baseline_menu_count}",
-            timeout=3000,
+        # Capture the menu-count baseline so we can detect the *new* menu the
+        # trigger click mounts (avoids racing with unrelated portal menus that may
+        # already be mounted on the page).
+        baseline_menu_count = await page.evaluate(
+            "() => document.querySelectorAll('[role=\"menu\"]').length"
         )
-    except Exception as e:
-        await safe_screenshot(page, run_dir / "error-chip_submenu_open.png")
-        (run_dir / "error.html").write_text(await page.content())
-        log_stage("error", reason="pro_effort_submenu_open_failed", exception=f"{type(e).__name__}: {e}")
-        await page.keyboard.press("Escape")
-        return False, text
 
-    # Scope the Extended lookup to the newest-mounted menu (the submenu the
-    # trigger just opened). Leaves are role='menuitemradio'. Anchor the regex
-    # so future variants like "Extended+" or "Extended (beta)" don't silently
-    # match — those would be intentional product changes worth reviewing.
-    submenu = page.locator('[role="menu"]').last
-    item = submenu.get_by_role("menuitemradio", name=re.compile(rf"^{EXTENDED_TOKEN}$"))
-    try:
-        await item.first.click(timeout=5000)
-    except Exception as e:
-        await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
-        (run_dir / "error.html").write_text(await page.content())
-        log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
-        await page.keyboard.press("Escape")
-        return False, text
+        trigger = page.locator(f'[data-testid="{PRO_EFFORT_TRIGGER_TESTID}"]').first
+        try:
+            await trigger.wait_for(state="attached", timeout=3000)
+            await trigger.evaluate("el => el.click()")
+        except Exception as e:
+            await safe_screenshot(page, run_dir / "error-chip_pro_trigger.png")
+            (run_dir / "error.html").write_text(await page.content())
+            log_stage("error", reason="pro_effort_trigger_click_failed", exception=f"{type(e).__name__}: {e}")
+            await page.keyboard.press("Escape")
+            return False, text
 
-    # Poll up to 5s for the chip text to update. The post-click confirmation is
-    # looser than the fast-path predicate: we already navigated through Pro's
-    # submenu, so any "Extended"-containing label proves the click took effect.
-    deadline = time.time() + 5.0
-    final_text = text
-    while time.time() < deadline:
-        final_text = (await chip.inner_text()).strip()
-        if EXTENDED_TOKEN in final_text:
-            return True, final_text
-        await asyncio.sleep(0.2)
-    return False, final_text
+        try:
+            await page.wait_for_function(
+                f"document.querySelectorAll('[role=\"menu\"]').length > {baseline_menu_count}",
+                timeout=3000,
+            )
+        except Exception as e:
+            await safe_screenshot(page, run_dir / "error-chip_submenu_open.png")
+            (run_dir / "error.html").write_text(await page.content())
+            log_stage("error", reason="pro_effort_submenu_open_failed", exception=f"{type(e).__name__}: {e}")
+            await page.keyboard.press("Escape")
+            return False, text
+
+        # Scope the Extended lookup to the newest-mounted menu (the submenu the
+        # trigger just opened). Leaves are role='menuitemradio'. Anchor the regex
+        # so future variants like "Extended+" or "Extended (beta)" don't silently
+        # match — those would be intentional product changes worth reviewing.
+        submenu = page.locator('[role="menu"]').last
+        item = submenu.get_by_role("menuitemradio", name=re.compile(rf"^{EXTENDED_TOKEN}$"))
+        try:
+            await item.first.click(timeout=5000)
+        except Exception as e:
+            await safe_screenshot(page, run_dir / "error-chip_menuitem.png")
+            (run_dir / "error.html").write_text(await page.content())
+            log_stage("error", reason="chip_menuitem_missing", exception=f"{type(e).__name__}: {e}")
+            await page.keyboard.press("Escape")
+            return False, text
+
+        # Poll up to 5s for the chip text to update. The post-click confirmation is
+        # looser than the fast-path predicate: we already navigated through Pro's
+        # submenu, so any "Extended"-containing label proves the click took effect.
+        deadline = time.time() + 5.0
+        final_text = text
+        while time.time() < deadline:
+            final_text = (await chip.inner_text()).strip()
+            if EXTENDED_TOKEN in final_text:
+                return True, final_text
+            await asyncio.sleep(0.2)
+        return False, final_text
 
 
 async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
@@ -474,10 +553,14 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 
 async def cmd_doctor() -> int:
     run_dir = new_run_dir("doctor")
+    ensure_shared_chrome_running()
     async with async_playwright() as pw:
-        browser, ctx, page = await launch_chrome(pw)
+        ctx = await connect_shared_chrome(pw)
+        page = await ctx.new_page()
         try:
-            await activate_chrome_for_paint(page)
+            # bind only, NOT bring_to_front: a worker may be mid-paste in another
+            # tab. Screenshots work on background tabs in a windowed Chrome.
+            bind_chrome_compositor_surface()
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             await pin_viewport_cdp(ctx, page)
             ok = await wait_for_login(ctx, timeout=30.0)
@@ -499,7 +582,10 @@ async def cmd_doctor() -> int:
                 "run_dir": str(run_dir),
             }
         finally:
-            await browser.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
     print(json.dumps(result, indent=2))
     return 0 if ok else 1
 
@@ -507,18 +593,27 @@ async def cmd_doctor() -> int:
 # ---- login ----
 
 async def cmd_login() -> int:
+    ensure_shared_chrome_running()
     async with async_playwright() as pw:
-        browser, ctx, page = await launch_chrome(pw)
+        ctx = await connect_shared_chrome(pw)
+        page = await ctx.new_page()
         try:
-            await activate_chrome_for_paint(page)
+            # login is interactive — user needs the tab frontmost. If a worker
+            # is mid-paste, login will hijack its focus; documented as
+            # "don't run login while workers are active."
+            bind_chrome_compositor_surface()
+            await bring_tab_to_front(page)
             await page.goto("https://chatgpt.com/")
             await pin_viewport_cdp(ctx, page)
-            print(f"Chrome launched against {PROFILE}", file=sys.stderr)
+            print(f"Chrome bound to {PROFILE}", file=sys.stderr)
             print("Sign in to ChatGPT in the window. Login auto-detects.", file=sys.stderr)
             ok = await wait_for_login(ctx)
             print("Login detected." if ok else "Timed out without detecting login.", file=sys.stderr)
         finally:
-            await browser.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
     return 0 if ok else 1
 
 
@@ -622,6 +717,19 @@ async def cmd_ask(args) -> int:
                     "run_dir": str(run_dir),
                 })
                 return 2
+            else:
+                # meta.json exists but is missing/corrupt prompt_sha256.
+                # Most likely cause: a prior `ask` was killed between mkdir
+                # and the atomic_write of meta.json. Fail closed rather than
+                # spawn a duplicate worker that would race on result.json.
+                stderr_jsonl({
+                    "status": "error",
+                    "reason": "run_id_conflict_no_sha",
+                    "run_id": run_id,
+                    "run_dir": str(run_dir),
+                    "hint": "Delete the run_dir and retry, or use a fresh --run-id.",
+                })
+                return 2
 
     if spawn_worker:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -685,28 +793,53 @@ async def _log_response(resp, log: list) -> None:
         pass
 
 
-async def _paste_prompt(page, prompt_text: str) -> None:
-    """Paste prompt_text into the focused composer via the system clipboard.
+async def _focus_and_paste(page, composer, prompt_text: str) -> None:
+    """Hold UiClipboardLock; activate Chrome; focus composer; pbcopy + Cmd+V; wait for paste to settle; restore clipboard.
 
-    Playwright's keyboard.insert_text dispatches a single synthetic input event;
-    ProseMirror reacts by re-rendering the entire document, which chokes on
-    multi-hundred-KB inputs. Cmd+V hits the contenteditable's paste handler
-    instead, which ChatGPT's UI is optimized for. Saves and restores the user's
-    clipboard since the Mac mini may be in interactive use.
+    The lock spans focus + paste, not just pbcopy/pbpaste, because `Meta+V` is
+    dispatched by Chrome to the OS-active window's active tab — a concurrent
+    worker that calls `bring_to_front()` mid-keystroke would redirect this
+    paste to its own composer. We also wait for ProseMirror to actually ingest
+    the paste (composer text length reaches a sentinel) before releasing the
+    lock — `keyboard.press("Meta+V")` returns when the CDP event is dispatched,
+    not when the paste handler has finished. Without the wait, the next worker
+    can pbcopy something else while ProseMirror is still consuming our paste.
+
+    Why pbcopy + Cmd+V instead of `keyboard.insert_text`: ProseMirror re-renders
+    the whole document on synthetic input events and chokes on multi-hundred-KB
+    inputs; Cmd+V hits the contenteditable's optimized paste handler. Saves and
+    restores the user's clipboard since the Mac mini may be in interactive use.
     """
-    try:
-        before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        before = None
-    try:
-        subprocess.run(["pbcopy"], input=prompt_text, text=True, check=True, timeout=10)
-        await page.keyboard.press("Meta+V")
-    finally:
-        if before is not None:
+    with UiClipboardLock():
+        bind_chrome_compositor_surface()
+        await bring_tab_to_front(page)
+        try:
+            before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            before = None
+        try:
+            await composer.click()
+            subprocess.run(["pbcopy"], input=prompt_text, text=True, check=True, timeout=10)
+            await page.keyboard.press("Meta+V")
+            # Wait until the send button mounts before releasing the lock. The
+            # send button is only mounted when the composer has non-empty
+            # content — its presence proves ProseMirror's paste handler ran
+            # to completion. Without this gate, the next worker can pbcopy
+            # over our prompt while our paste handler is still reading the
+            # OS clipboard. Same selector used by the actual send-click below.
             try:
-                subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
-            except Exception:
-                pass
+                await page.wait_for_selector(
+                    '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]',
+                    timeout=10000, state="visible",
+                )
+            except Exception as e:
+                log_stage("paste_settle_skipped", exception=f"{type(e).__name__}: {e}")
+        finally:
+            if before is not None:
+                try:
+                    subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
+                except Exception:
+                    pass
 
 
 async def _copy_button_present(page) -> bool:
@@ -733,73 +866,159 @@ async def _copy_button_present(page) -> bool:
 
 
 async def _copy_button_extract(page) -> str | None:
-    """Click the last assistant message's Copy button and read system clipboard.
+    """Hold UiClipboardLock; activate Chrome + bring tab to front; click Copy; read pbpaste; ALWAYS restore.
 
     Preserves markdown fidelity (math, code fences, tables) where innerText mangles them.
     Returns None if the copy didn't change the clipboard (button missing, permission denied,
     not on macOS, etc.) — caller should fall back to innerText.
+
+    The lock spans baseline pbpaste + click + post-click pbpaste + restore so a
+    concurrent worker's clipboard write cannot race into our `after` read. The
+    `try/finally` ensures `before` is restored whenever a Copy click was attempted,
+    even on early-return paths — otherwise we'd leak the assistant's response into
+    the user's clipboard if pbpaste(after) raises.
     """
-    try:
-        before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return None
-
-    clicked = False
-    try:
-        clicked = await page.evaluate("""() => {
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            const last = msgs[msgs.length - 1];
-            if (!last) return false;
-            const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
-            if (!container) return false;
-            const btn = container.querySelector('[data-testid="copy-turn-action-button"]');
-            if (!btn) return false;
-            btn.click();
-            return true;
-        }""")
-    except Exception:
-        return None
-    if not clicked:
-        return None
-
-    await asyncio.sleep(0.6)
-    try:
-        after = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return None
-
-    # Restore the user's clipboard if we changed it — the Mac mini may be in
-    # interactive use and we shouldn't clobber whatever they had copied.
-    if after != before:
+    with UiClipboardLock():
+        bind_chrome_compositor_surface()
+        await bring_tab_to_front(page)
         try:
-            subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
+            before = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
         except Exception:
-            pass
+            return None
 
-    if after and after != before and after.strip():
-        return after
-    return None
+        try:
+            clicked = await page.evaluate("""() => {
+                const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+                const last = msgs[msgs.length - 1];
+                if (!last) return false;
+                const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
+                if (!container) return false;
+                const btn = container.querySelector('[data-testid="copy-turn-action-button"]');
+                if (!btn) return false;
+                btn.click();
+                return true;
+            }""")
+        except Exception:
+            return None
+        if not clicked:
+            return None
+
+        # Click was attempted — from here, always restore `before` no matter how we exit.
+        try:
+            await asyncio.sleep(0.6)
+            try:
+                after = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5).stdout
+            except Exception:
+                return None
+            if after and after != before and after.strip():
+                return after
+            return None
+        finally:
+            # Restore in finally so an exception in pbpaste-after, or early return,
+            # cannot leave the assistant's just-copied response on the user's clipboard.
+            try:
+                subprocess.run(["pbcopy"], input=before, text=True, timeout=5)
+            except Exception:
+                pass
 
 
-class BrowserLock:
-    """Serializes access to the Chrome profile across worker processes via fcntl flock."""
-    def __init__(self, path: Path = BROWSER_LOCK):
+class _FlockGuard:
+    """Plain mutual-exclusion fcntl flock context manager. Held briefly only."""
+    def __init__(self, path: Path):
         self.path = path
         self._fd = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.path, "w")
-        fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
-        _kill_chrome_orphans()
+        fd = open(self.path, "w")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+        except BaseException:
+            fd.close()
+            raise
+        self._fd = fd
         return self
 
     def __exit__(self, *_):
+        if self._fd is None:
+            return
         try:
             fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
         finally:
             self._fd.close()
             self._fd = None
+
+
+class LaunchLock(_FlockGuard):
+    """Held only across the CDP-probe-and-conditional-launch path. Never held during
+    a run's per-tab work — that would re-introduce the old whole-section serialization."""
+    def __init__(self):
+        super().__init__(LAUNCH_LOCK)
+
+
+class UiClipboardLock(_FlockGuard):
+    """Held across the foreground+focus+pbcopy+Meta+V transaction (paste path) and
+    across baseline pbpaste + click-Copy + post-click pbpaste + restore (extract path).
+
+    Wider than just `pbpaste` because `Meta+V` follows OS focus and ChatGPT's
+    Copy-button onClick uses `navigator.clipboard.writeText` which requires
+    document focus. Two parallel workers must not interleave these phases or
+    they will silently swap each other's prompts/responses through the global
+    macOS pasteboard."""
+    def __init__(self):
+        super().__init__(CLIPBOARD_LOCK)
+
+
+class ParallelSlot:
+    """File-lock semaphore admitting at most max_parallel concurrent _run workers.
+
+    On enter, tries non-blocking LOCK_EX on slot files 0..N-1 in order; if all
+    are taken, polls every 2s. Emits one `slot_queued` JSONL line when waiting
+    starts and a `slot_acquired` line on success with the wait duration.
+    """
+    def __init__(self, max_parallel: int):
+        self.max_parallel = max_parallel
+        self._fd = None
+        self._slot_id = None
+
+    def __enter__(self):
+        SLOT_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        wait_start = time.time()
+        queued_logged = False
+        while True:
+            for slot_id in range(self.max_parallel):
+                fd = open(SLOT_LOCK_DIR / f"slot-{slot_id}.lock", "w")
+                try:
+                    fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    fd.close()
+                    continue
+                except BaseException:
+                    fd.close()
+                    raise
+                self._fd = fd
+                self._slot_id = slot_id
+                log_stage(
+                    "slot_acquired",
+                    slot_id=slot_id,
+                    max_parallel=self.max_parallel,
+                    waited_secs=round(time.time() - wait_start, 2),
+                )
+                return self
+            if not queued_logged:
+                log_stage("slot_queued", max_parallel=self.max_parallel)
+                queued_logged = True
+            time.sleep(2.0)
+
+    def __exit__(self, *_):
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fd.close()
+            self._fd = None
+            self._slot_id = None
 
 
 async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
@@ -818,35 +1037,33 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
         return d
 
     log_stage("start", run_id=run_id)
-    lock_wait_start = time.time()
-    with BrowserLock():
-        lock_wait_secs = time.time() - lock_wait_start
-        log_stage("lock_acquired", waited_secs=round(lock_wait_secs, 2))
+    with ParallelSlot(get_max_parallel()):
         return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err)
 
 
 async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> dict:
-    def worker_exception_result(e: Exception) -> dict:
-        return {
-            "status": "error",
-            "reason": "worker_exception",
-            "exception": f"{type(e).__name__}: {e}",
-            "run_id": run_id,
-            "run_dir": str(run_dir),
-            "exit_code": 1,
-        }
+    def exc(e: Exception) -> dict:
+        return err("worker_exception", {"exception": f"{type(e).__name__}: {e}"})
 
     try:
+        ensure_shared_chrome_running()
         async with async_playwright() as pw:
-            browser, ctx, page = await launch_chrome(pw)
-            # Inner try/except/finally guarantees browser.close() runs while
-            # Chrome is still alive — clean shutdown flushes cookie/session
-            # SQLite. Worker-exception screenshots also live inside the inner
-            # try so they're captured before Chrome is torn down.
+            ctx = await connect_shared_chrome(pw)
+            page = await ctx.new_page()
+            # Worker owns this Page only. Closing it on exit removes our tab from
+            # the shared Chrome without affecting other workers' tabs. We do NOT
+            # call browser.close() — that would CDP-disconnect the shared process
+            # (and historically that has terminated Chrome). The Playwright
+            # `async with` exit drops our connection without killing Chrome.
+            #
+            # We do NOT call bring_tab_to_front or bind_chrome_compositor_surface
+            # here. Those run only inside UiClipboardLock (in _focus_and_paste
+            # and _copy_button_extract). An early bring_to_front would hijack a
+            # concurrent worker's mid-paste keystroke. Screenshots work on
+            # background tabs in a windowed Chrome.
             try:
-                await activate_chrome_for_paint(page)
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
-                log_stage("chrome_launched")
+                log_stage("chrome_connected")
 
                 await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
                 await pin_viewport_cdp(ctx, page)
@@ -866,8 +1083,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 log_stage("model_verified", chip_text=chip_text)
 
                 composer = page.get_by_role("textbox").first
-                await composer.click()
-                await _paste_prompt(page, prompt_text)
+                await _focus_and_paste(page, composer, prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
 
                 await safe_screenshot(page, run_dir / "pre-send.png")
@@ -945,16 +1161,20 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                     (run_dir / "error.html").write_text(await page.content())
                 except Exception:
                     pass
-                return worker_exception_result(e)
+                return exc(e)
             finally:
+                # Bounded close: a hung CDP session must not hold the
+                # ParallelSlot indefinitely. Playwright's `async with` exit
+                # drops the connection regardless.
                 try:
-                    await browser.close()
-                except Exception:
-                    pass
+                    await asyncio.wait_for(page.close(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    log_stage("page_close_timeout")
+                except Exception as e:
+                    log_stage("page_close_skipped", exception=f"{type(e).__name__}: {e}")
     except Exception as e:
-        # Pre-page setup error (Chrome won't launch, etc). No page to screenshot.
         log_stage("error", reason="worker_exception", exception=f"{type(e).__name__}: {e}")
-        return worker_exception_result(e)
+        return exc(e)
     finally:
         try:
             (run_dir / "network.json").write_text(json.dumps(network_log, indent=2))
@@ -984,6 +1204,27 @@ async def cmd_run(args) -> int:
     return result.get("exit_code", 1)
 
 
+# ---- close-chrome ----
+
+def cmd_close_chrome(force: bool = False) -> int:
+    """Tear down the shared gpt-pro Chrome process. Held under LaunchLock.
+
+    Refuses by default when any worker holds a ParallelSlot — killing Chrome
+    out from under live tabs costs in-flight Pro Extended runs (5–20 min each).
+    Pass --force to bypass.
+    """
+    with LaunchLock():
+        if not force and _slots_held():
+            stderr_jsonl({
+                "status": "error",
+                "reason": "workers_in_flight",
+                "hint": "Wait for active runs to finish, or pass --force.",
+            })
+            return 1
+        _kill_chrome_orphans()
+    return 0
+
+
 # ---- main ----
 
 def main() -> int:
@@ -991,6 +1232,9 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="Open Chrome on chatgpt.com to sign in. Cookies persist for `ask`.")
     sub.add_parser("doctor", help="Verify the profile is logged in. Prints JSON; saves screenshot + HTML.")
+    close_p = sub.add_parser("close-chrome", help="Tear down the shared gpt-pro Chrome. Refuses if workers are in flight.")
+    close_p.add_argument("--force", action="store_true",
+                         help="Kill Chrome even if workers hold ParallelSlots. In-flight runs will lose their CDP connection.")
 
     ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT Pro Extended. Prints response on stdout when ready.")
     ask_p.add_argument("--run-id", default=None,
@@ -1024,6 +1268,8 @@ def main() -> int:
         return asyncio.run(cmd_fetch(args))
     if args.cmd == "_run":
         return asyncio.run(cmd_run(args))
+    if args.cmd == "close-chrome":
+        return cmd_close_chrome(force=args.force)
     return 1
 
 
