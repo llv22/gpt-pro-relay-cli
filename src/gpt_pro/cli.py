@@ -1086,6 +1086,34 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 await _focus_and_paste(page, composer, prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
 
+                # Wait for any pasted-text-attachment upload to finish before
+                # clicking Send. Prompts past ChatGPT's paste threshold get
+                # auto-converted to a "Pasted text" attachment that uploads
+                # asynchronously; the send button stays `disabled` until the
+                # upload completes. Playwright's default 30s click-wait is
+                # shorter than realistic uploads on a flaky link (observed
+                # ~60s on 442KB prompts). Gate explicitly with a wider hard
+                # ceiling so a stuck upload fails closed at a bounded deadline
+                # instead of masquerading as a 30s click timeout. Outside
+                # UiClipboardLock — sibling workers must stay free to paste.
+                send_ready_selector = (
+                    '[data-testid="send-button"]:not([disabled]):not([aria-disabled="true"]), '
+                    'button[aria-label="Send prompt"]:not([disabled]):not([aria-disabled="true"]), '
+                    'button[aria-label="Send message"]:not([disabled]):not([aria-disabled="true"])'
+                )
+                upload_wait_start = time.time()
+                try:
+                    await page.wait_for_selector(send_ready_selector, timeout=300_000, state="visible")
+                finally:
+                    upload_wait_elapsed = time.time() - upload_wait_start
+                    if upload_wait_elapsed >= 2.0:
+                        log_stage(
+                            "paste_upload_wait",
+                            chars=len(prompt_text),
+                            elapsed_secs=round(upload_wait_elapsed, 1),
+                            timeout_secs=300,
+                        )
+
                 await safe_screenshot(page, run_dir / "pre-send.png")
                 send_btn = page.locator(
                     '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
