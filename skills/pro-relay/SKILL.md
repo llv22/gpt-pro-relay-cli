@@ -18,6 +18,39 @@ user-invocable: true
 
 One prompt in, one response out. The browser automation runs on mac behind SSH against a dedicated logged-in profile. The work is done by a detached worker so SSH drops don't kill it — you can reconnect and `fetch` the result.
 
+## Prompts must be self-contained
+
+GPT-Pro runs in a ChatGPT web tab. **It cannot read your codebase, run shell commands, follow links, or see anything from this local conversation.** Every byte it needs to answer must be inside the heredoc body. If you reference a file path, paste its contents. If a decision earlier in this session shapes the answer, paste that excerpt.
+
+Err toward more context, not less — the 1 MB submission cap is generous, and a run that fails for missing context still burns 5–20 min of Pro quota.
+
+Compose the prompt in a file (so file contents with `$`, backticks, or heredoc markers don't get mangled), then submit it via stdin redirect:
+
+```bash
+PROMPT_FILE=$(mktemp)
+{
+  cat <<'TASK'
+<one-sentence outcome>
+
+Success criteria:
+- ...
+TASK
+
+  echo
+  echo '=== src/foo.py ==='
+  cat src/foo.py
+
+  echo
+  echo '=== tests/test_foo.py ==='
+  cat tests/test_foo.py
+} > "$PROMPT_FILE"
+
+# Then in Phase 1 below, replace the inline heredoc with a stdin redirect:
+ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" --no-wait < "$PROMPT_FILE"
+```
+
+For recurring tasks, factor the composer into a small `compose-prompt.sh` in the project — keep the file list and section headers there rather than rewriting them on every call.
+
 ## The command
 
 > **About the bare `gpt-pro-relay` command:** it's not a system tool. The remote shell finds it because the project ships a console script (in `.venv/bin/gpt-pro-relay`) that's symlinked into a directory on the SSH non-interactive `PATH` (e.g. `~/.local/bin/gpt-pro-relay`). If you get `gpt-pro-relay: command not found`, the symlink isn't set up — fall back to the absolute venv path (`<repo>/.venv/bin/gpt-pro-relay`) or follow the repo's "Optional: bare command on PATH" setup.
