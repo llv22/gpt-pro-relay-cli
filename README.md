@@ -157,11 +157,10 @@ Up to `GPT_PRO_MAX_PARALLEL` (default 3) `ask` invocations run in parallel — e
 - Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
 - If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.
 
-## Claude Code skills
+## Claude Code skill
 
-Two [Claude Code skills](https://docs.claude.com/en/docs/claude-code/skills) ship with the repo. Copy whichever matches your setup into `~/.claude/skills/<name>/`:
+A [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) ships with the repo for direct, same-Mac invocation:
 
-- [`skills/pro-relay/SKILL.md`](skills/pro-relay/SKILL.md) — wraps the SSH command. Edit the `mac` alias to your own. Use this when Claude Code is on a different machine than ChatGPT.
-- [`skills/gpt-pro-local/SKILL.md`](skills/gpt-pro-local/SKILL.md) — direct invocation, no SSH. Use this when Claude Code is on the same Mac as ChatGPT.
+- [`skills/gpt-pro-local/SKILL.md`](skills/gpt-pro-local/SKILL.md) — wraps `gpt-pro-relay ask` with no SSH hop. Copy into `~/.claude/skills/gpt-pro-local/`. Claude triggers on prompts like "ask gpt-pro about X" or "get a Pro Extended take on Y".
 
-Either way, Claude triggers on prompts like "ask gpt-pro about X" or "get a Pro Extended take on Y".
+For the SSH-relay flow (Claude Code on a different machine than ChatGPT), the polling pattern in [Usage over SSH](#usage-over-ssh) is the contract — wrap it in your own skill if you want trigger-phrase activation.
