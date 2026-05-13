@@ -6,7 +6,7 @@ description: |
   (e.g. you cloned the repo, ran `uv sync`, and either symlinked into `~/.local/bin/` or
   activated the venv). Triggers on "ask gpt-pro", "send to gpt-pro", "use gpt-pro", "get a
   Pro Extended take", "ask the deep model", "second opinion from chatgpt pro" — same triggers
-  as the SSH-wrapped variant. For the SSH-wrapped variant, install the `pro-relay` skill
+  as the SSH-wrapped variant. For the SSH-wrapped variant, install the `gpt-pro-relay` skill
   instead. Returns response on stdout. Resilient to parent-process death via caller-supplied
   `--run-id` plus a `fetch` recovery command.
 allowed-tools: Bash(gpt-pro-relay:*), Bash(uuidgen:*), Bash(date:*), Read, Write
@@ -15,7 +15,7 @@ user-invocable: true
 
 # gpt-pro-local
 
-Same as `pro-relay`, minus SSH. The browser automation runs on the same machine as Claude Code, against a dedicated logged-in profile. The work is done by a detached worker so a parent-process crash doesn't kill it — the run survives and `fetch` recovers it.
+Same as `gpt-pro-relay`, minus SSH. The browser automation runs on the same machine as Claude Code, against a dedicated logged-in profile. The work is done by a detached worker so a parent-process crash doesn't kill it — the run survives and `fetch` recovers it.
 
 ## The command
 
@@ -148,7 +148,7 @@ Since you're local, `Read` them directly when diagnosing.
 |---|---|
 | Pro Extended reasoning on the same Mac as Claude Code | Yes |
 | Tolerating parent-process death on a 5–20 min run | Yes (drop-recovery via `fetch`) |
-| Driving a remote Mac over SSH | Use `pro-relay` instead |
+| Driving a remote Mac over SSH | Use `gpt-pro-relay` instead |
 | Multi-turn follow-ups in the same chat | Doesn't fit — one-shot per invocation |
 
 ## Multi-turn
