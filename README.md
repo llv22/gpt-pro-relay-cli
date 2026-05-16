@@ -159,8 +159,4 @@ Up to `GPT_PRO_MAX_PARALLEL` (default 3) `ask` invocations run in parallel — e
 
 ## Claude Code skill
 
-A [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) ships with the repo for direct, same-Mac invocation:
-
-- [`skills/gpt-pro-local/SKILL.md`](skills/gpt-pro-local/SKILL.md) — wraps `gpt-pro-relay ask` with no SSH hop. Copy into `~/.claude/skills/gpt-pro-local/`. Claude triggers on prompts like "ask gpt-pro about X" or "get a Pro Extended take on Y".
-
-For the SSH-relay flow (Claude Code on a different machine than ChatGPT), the polling pattern in [Usage over SSH](#usage-over-ssh) is the contract — wrap it in your own skill if you want trigger-phrase activation.
+No skill ships with this repo. For the SSH-relay flow (Claude Code on a different machine than ChatGPT), the polling pattern in [Usage over SSH](#usage-over-ssh) is the contract — wrap it in your own [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) if you want trigger-phrase activation.
