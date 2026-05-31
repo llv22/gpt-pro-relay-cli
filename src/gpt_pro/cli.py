@@ -397,6 +397,17 @@ async def is_logged_in(ctx) -> bool:
 # `[[data-collapse-labels]_&]:sr-only`).
 COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
 EXTENDED_TOKEN = "Extended"
+# Ground-truth model slugs stamped on the served assistant turn
+# (data-message-model-slug). This is the only *authoritative* model signal, but
+# it only exists after Send, so it backstops the pre-send chip gate rather than
+# replacing it. See served_assistant_model_slug / the post-completion audit.
+# An explicit allowlist (not a prefix test): a prefix like "gpt-5-5-pro" would
+# wrongly accept a hypothetical "gpt-5-5-pro-thinking". If OpenAI ships a new
+# Pro-family slug, add it here — a one-line, deliberate edit. Note the audit
+# verifies the *model* only; the pre-send chip (requiring both "Extended" and
+# "Pro") remains the sole signal for the reasoning *effort* — a server-side
+# effort downgrade with the Pro model intact is a documented residual risk.
+PRO_MODEL_SLUGS = frozenset({"gpt-5-5-pro"})
 
 
 def is_pro_extended_label(text: str | None) -> bool:
@@ -415,24 +426,49 @@ def is_pro_extended_label(text: str | None) -> bool:
 SSR_CHIP_PLACEHOLDER = "Model"  # Server-rendered text before React hydrates the user's actual selection.
 
 
-async def read_composer_chip_text(page, *, timeout: float = 30.0) -> str:
-    """Read the composer chip's text after React hydration.
+async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: int = 3) -> str:
+    """Read the composer chip's text after React hydration *and* settle.
 
     The chip's SSR text is 'Model'; hydration replaces it with the user's
     selected mode ('Extended', 'Extended Pro', 'Auto', etc.). We poll until the
     placeholder is gone — reading too early would cause a self-correction click
     on an unhydrated chip, which doesn't open the menu.
+
+    Beyond the SSR→hydrated transition, the chip passes through a *second*
+    transition the old "return first non-placeholder value" logic could not see:
+    React hydrates the pill optimistically from the persisted/last-used
+    selection (e.g. "Extended Pro"), then an async resolution overwrites it with
+    the new conversation's actual default (e.g. "Thinking"). Returning the first
+    value caught that transient and silently sent to the wrong model (run
+    ask-20260531T065451Z: read "Extended Pro", served gpt-5-5-thinking 2.6s
+    later). We now require the same non-placeholder text to repeat for
+    `stable_polls` consecutive reads (~`stable_polls * 0.2`s) before trusting it.
+
+    Pass `stable_polls=1` only to confirm a deliberate menu click took effect
+    (no hydration race there). On timeout, returns "" — never an unstable value
+    — so the caller's predicate fails closed. A re-render back through the
+    "Model" placeholder breaks the streak entirely (resets the candidate).
     """
     chip = page.locator(COMPOSER_CHIP).first
     await chip.wait_for(state="visible", timeout=timeout * 1000)
     deadline = time.time() + timeout
     last = ""
+    stable_count = 0
     while time.time() < deadline:
-        last = (await chip.inner_text()).strip()
-        if last and last != SSR_CHIP_PLACEHOLDER:
-            return last
+        cur = (await chip.inner_text()).strip()
+        if cur and cur != SSR_CHIP_PLACEHOLDER:
+            stable_count = stable_count + 1 if cur == last else 1
+            last = cur
+            if stable_count >= stable_polls:
+                return cur
+        else:
+            stable_count = 0
+            last = ""
         await asyncio.sleep(0.2)
-    return last
+    # Timed out without `stable_polls` consecutive identical reads: the chip
+    # never settled. Return "" (not the last transient) so is_pro_extended_label
+    # fails closed — an oscillating chip must not be accepted as verified.
+    return ""
 
 
 # The Effort submenu trigger inside the chip menu. Two "Effort" buttons share
@@ -842,6 +878,28 @@ async def _focus_and_paste(page, composer, prompt_text: str) -> None:
                     pass
 
 
+async def served_assistant_model_slug(page) -> str | None:
+    """Read the latest assistant turn's `data-message-model-slug`.
+
+    This attribute is the ground truth of which model actually served the turn
+    (unlike the composer chip, a pre-send projection of client state). Returns
+    the slug string, or None if no slugged assistant turn is present. A missing
+    attribute (selector drift / not-yet-rendered) yields None — the caller
+    treats that as "unverified" and logs it, degrading fail-open on the audit
+    only (the pre-send chip gate remains the primary defense).
+    """
+    try:
+        return await page.evaluate("""() => {
+            const msgs = Array.from(document.querySelectorAll(
+                '[data-message-author-role="assistant"][data-message-model-slug]'
+            ));
+            const last = msgs[msgs.length - 1];
+            return last ? last.getAttribute('data-message-model-slug') : null;
+        }""")
+    except Exception:
+        return None
+
+
 async def _copy_button_present(page) -> bool:
     """True if the latest assistant turn's post-completion Copy button is mounted.
 
@@ -1115,6 +1173,34 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                         )
 
                 await safe_screenshot(page, run_dir / "pre-send.png")
+
+                # Re-verify the model at the point of use — closes the
+                # time-of-check/time-of-use gap. ensure_extended_chip ran ~2.6s
+                # ago, right after page load; the chip can hydrate optimistically
+                # to "Extended Pro" and then re-resolve to the new conversation's
+                # default ("Thinking") during the paste/upload window, sending to
+                # the wrong model while model_verified logged "Extended Pro". This
+                # re-read is a passive inner_text() (no UiClipboardLock, no menu,
+                # no bring_to_front) so it can't hijack a sibling's paste. Fail
+                # closed: never send to a model we haven't verified. We do NOT
+                # re-run the chip menu here — that needs the clipboard lock and a
+                # fragile Radix dance with a loaded composer; surface the run_dir
+                # instead. Nothing slow runs between this read and the click.
+                #
+                # Uses the default stable read (not stable_polls=1): a chip
+                # actively oscillating at Send time must fail closed, not be
+                # accepted on a single lucky sample. The irreducible read→click
+                # window is backstopped by the served-slug audit after completion.
+                presend_chip = await read_composer_chip_text(page, timeout=10.0)
+                if not is_pro_extended_label(presend_chip):
+                    await safe_screenshot(page, run_dir / "error-model_drift.png")
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="model_drift_before_send",
+                              verified=chip_text, presend=presend_chip)
+                    return err("model_drift_before_send",
+                               {"verified": chip_text, "presend": presend_chip})
+                log_stage("model_reverified", chip_text=presend_chip)
+
                 send_btn = page.locator(
                     '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]'
                 ).first
@@ -1171,6 +1257,36 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                 log_stage("extracted", method=extraction, chars=len(response))
                 atomic_write(run_dir / "response.md", response)
 
+                # Authoritative post-hoc audit: the served assistant turn stamps
+                # the model that actually answered. The pre-send chip gate can
+                # still be defeated by a flip in its tiny read→click window or by
+                # a server-side downgrade that ignores the chip entirely.
+                served_slug = await served_assistant_model_slug(page)
+                log_stage("served_model", slug=served_slug)
+
+                # A *present* slug naming a non-Pro model is authoritative
+                # contamination — fail closed regardless of `completed`, so a
+                # timed-out Thinking turn is never quietly reported as a plain
+                # timeout. response.md is kept as a diagnostic artifact; the
+                # result is an error so it is never printed as a success.
+                if served_slug and served_slug not in PRO_MODEL_SLUGS:
+                    await safe_screenshot(page, run_dir / "error-served_model_mismatch.png")
+                    log_stage("error", reason="served_model_mismatch", slug=served_slug)
+                    return err("served_model_mismatch",
+                               {"served_slug": served_slug, "completed": completed,
+                                "response_chars": len(response)})
+
+                # A *missing* slug (selector drift / not-yet-rendered) degrades
+                # fail-OPEN — making it fatal would brick the tool on a single
+                # attribute rename, the exact blast radius the network-body-gate
+                # alternative was rejected for. But mark it explicitly so a caller
+                # can't mistake an unaudited answer for a verified one, and emit a
+                # distinct stage so selector drift is greppable, not blended into
+                # the normal served_model line.
+                model_audit = "verified" if served_slug in PRO_MODEL_SLUGS else "unverified_missing_slug"
+                if completed and model_audit != "verified":
+                    log_stage("served_model_unverified")
+
                 result = {
                     "status": "ok" if completed else "timeout",
                     "run_id": run_id,
@@ -1178,6 +1294,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> d
                     "run_dir": str(run_dir),
                     "response_chars": len(response),
                     "extraction": extraction,
+                    "model_audit": model_audit,
                     "exit_code": 0 if completed else 3,
                 }
                 log_stage("finished", status=result["status"])
