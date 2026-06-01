@@ -216,20 +216,25 @@ def probe_cdp(port: int, *, timeout: float = 1.0) -> bool:
         return False
 
 
-def _slots_held() -> bool:
-    """True if any other worker currently holds a ParallelSlot lock.
+def _slots_held(skip_slot_id: int | None = None) -> bool:
+    """True if any *other* worker currently holds a ParallelSlot lock.
 
     Probes each slot file with non-blocking LOCK_EX. If a slot is held by
     another process, our LOCK_EX fails with BlockingIOError. We only care
     about *other* workers, not ourselves — when called from inside our own
-    ParallelSlot, our own slot will fail this check too. Callers that need
-    to distinguish "any slot held" from "any *other* slot held" should pass
-    their own slot id to skip; for now we treat any held slot as workers-active
-    since the kill-orphans path is invoked from contexts that don't hold a slot.
+    ParallelSlot, our own slot file fails this check too (flock conflicts even
+    across two fds in the same process). Callers that hold a slot MUST pass
+    their own `skip_slot_id` so it isn't counted; otherwise a worker would see
+    its own slot as "held" and a wedged-Chrome recovery could never fire —
+    even for a lone serial run. The kill-orphans entrypoints that don't hold a
+    slot (login/doctor/close-chrome) pass None and count every held slot.
     """
     if not SLOT_LOCK_DIR.exists():
         return False
+    skip_name = f"slot-{skip_slot_id}.lock" if skip_slot_id is not None else None
     for path in SLOT_LOCK_DIR.glob("slot-*.lock"):
+        if skip_name is not None and path.name == skip_name:
+            continue
         try:
             fd = open(path, "w")
         except OSError:
@@ -245,7 +250,7 @@ def _slots_held() -> bool:
     return False
 
 
-def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT) -> bool:
+def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: int | None = None) -> bool:
     """Idempotent: launch Chrome bound to PROFILE if its CDP isn't responding.
 
     Returns True iff this call performed the launch (the "owner" return), False if
@@ -254,9 +259,11 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT) -> bool:
 
     Kill-orphan safety: under heavy load a healthy Chrome can fail a 1s probe.
     Inside LaunchLock we re-probe with a 3s timeout and one retry, AND we refuse
-    to kill if any other worker is currently holding a ParallelSlot (i.e., has
+    to kill if any *other* worker is currently holding a ParallelSlot (i.e., has
     a live tab in the same Chrome). The combination prevents the "transient CDP
-    stall under load → kill the live Chrome" failure mode.
+    stall under load → kill the live Chrome" failure mode. A slot-holding caller
+    MUST pass its own `skip_slot_id` so its own slot isn't mistaken for another
+    worker's — otherwise a genuinely wedged Chrome could never be recovered.
 
     On the launch path, also bind the CoreAnimation surface once. Followers
     don't need to bind — Chrome's compositor stays bound for the rest of its
@@ -274,7 +281,7 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT) -> bool:
         # CDP is genuinely unresponsive. Refuse to kill if other workers are
         # using the shared Chrome — they'd lose their tabs. Surface a clear
         # error for the operator.
-        if _slots_held():
+        if _slots_held(skip_slot_id=skip_slot_id):
             raise RuntimeError(
                 "Chrome CDP unresponsive but other workers hold ParallelSlots; "
                 "refusing to kill shared Chrome. Wait for active runs to finish, "
@@ -1095,16 +1102,16 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
         return d
 
     log_stage("start", run_id=run_id)
-    with ParallelSlot(get_max_parallel()):
-        return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err)
+    with ParallelSlot(get_max_parallel()) as slot:
+        return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot._slot_id)
 
 
-async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err) -> dict:
+async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot_id) -> dict:
     def exc(e: Exception) -> dict:
         return err("worker_exception", {"exception": f"{type(e).__name__}: {e}"})
 
     try:
-        ensure_shared_chrome_running()
+        ensure_shared_chrome_running(skip_slot_id=slot_id)
         async with async_playwright() as pw:
             ctx = await connect_shared_chrome(pw)
             page = await ctx.new_page()

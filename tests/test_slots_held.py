@@ -1,0 +1,71 @@
+"""Regression tests for the ParallelSlot self-count deadlock.
+
+Runs ask-20260601T2010* (and the 200833 batch) all failed ~1s after
+`slot_acquired` with "Chrome CDP unresponsive but other workers hold
+ParallelSlots; refusing to kill shared Chrome." The shared Chrome's CDP had
+genuinely wedged, but recovery could never fire: `ensure_shared_chrome_running`
+runs *inside* the worker's own ParallelSlot, and the old `_slots_held()` counted
+that own slot as a held one — so every worker (even a lone serial run) saw a slot
+held and refused to kill+relaunch. These tests pin the fix: a slot-holding caller
+passes `skip_slot_id` so only *other* workers block the kill.
+"""
+
+import fcntl
+
+from gpt_pro import cli
+
+
+def _hold(path):
+    """Open `path` and take a non-blocking exclusive flock, returning the fd."""
+    fd = open(path, "w")
+    fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def _release(*fds):
+    for fd in fds:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        fd.close()
+
+
+def test_slots_held_skips_own_slot(tmp_path, monkeypatch):
+    slots = tmp_path / "slots"
+    slots.mkdir()
+    monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+
+    # A lone worker holding only its own slot-0 — the exact failing scenario.
+    fd0 = _hold(slots / "slot-0.lock")
+    try:
+        # Without the skip, the worker counts its own slot: the deadlock bug.
+        assert cli._slots_held() is True
+        # With the skip, no *other* worker is active, so recovery may proceed.
+        assert cli._slots_held(skip_slot_id=0) is False
+    finally:
+        _release(fd0)
+
+
+def test_slots_held_still_sees_other_worker(tmp_path, monkeypatch):
+    slots = tmp_path / "slots"
+    slots.mkdir()
+    monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+
+    # Worker on slot 0 while a *real* second worker holds slot 1.
+    fd0 = _hold(slots / "slot-0.lock")
+    fd1 = _hold(slots / "slot-1.lock")
+    try:
+        # The skip must not blind us to the genuinely-active sibling tab.
+        assert cli._slots_held(skip_slot_id=0) is True
+    finally:
+        _release(fd0, fd1)
+
+
+def test_slots_held_empty_when_nothing_held(tmp_path, monkeypatch):
+    slots = tmp_path / "slots"
+    slots.mkdir()
+    monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+
+    # Stale, unlocked lock files (left behind after workers exit) are not "held".
+    (slots / "slot-0.lock").write_text("")
+    (slots / "slot-1.lock").write_text("")
+    assert cli._slots_held() is False
+    assert cli._slots_held(skip_slot_id=0) is False
