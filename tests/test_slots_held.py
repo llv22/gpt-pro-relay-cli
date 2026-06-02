@@ -12,6 +12,8 @@ passes `skip_slot_id` so only *other* workers block the kill.
 
 import fcntl
 
+import pytest
+
 from gpt_pro import cli
 
 
@@ -69,3 +71,82 @@ def test_slots_held_empty_when_nothing_held(tmp_path, monkeypatch):
     (slots / "slot-1.lock").write_text("")
     assert cli._slots_held() is False
     assert cli._slots_held(skip_slot_id=0) is False
+
+
+def test_slots_held_skips_only_the_named_slot(tmp_path, monkeypatch):
+    slots = tmp_path / "slots"
+    slots.mkdir()
+    monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+
+    fd0 = _hold(slots / "slot-0.lock")
+    fd1 = _hold(slots / "slot-1.lock")
+    try:
+        # Skipping a non-first slot must not short-circuit the scan of the rest
+        # (glob order is filesystem-dependent) — the held sibling still blocks.
+        assert cli._slots_held(skip_slot_id=1) is True
+        assert cli._slots_held(skip_slot_id=0) is True
+    finally:
+        _release(fd0, fd1)
+
+
+class _DummyLock:
+    """Stand-in for LaunchLock so the recovery path needs no real launch.lock."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+def _wire_recovery(monkeypatch, tmp_path):
+    """Drive ensure_shared_chrome_running down the wedged-CDP recovery path with
+    all real side effects (kill, relaunch) mocked. probe_cdp reports wedged for
+    the fast probe + 2 re-probes, then healthy once the relaunch is issued."""
+    slots = tmp_path / "slots"
+    slots.mkdir(exist_ok=True)
+    monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
+    monkeypatch.setattr(cli, "LaunchLock", _DummyLock)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(cli, "log_stage", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_chrome_open_argv", lambda port: [])
+    calls = {"kill": 0, "popen": 0}
+    monkeypatch.setattr(cli, "_kill_chrome_orphans",
+                        lambda: calls.__setitem__("kill", calls["kill"] + 1))
+    monkeypatch.setattr(cli.subprocess, "Popen",
+                        lambda *_a, **_k: calls.__setitem__("popen", calls["popen"] + 1))
+    seq = {"n": 0}
+
+    def fake_probe(port, timeout=1.0):
+        seq["n"] += 1
+        return seq["n"] > 3  # wedged for fast-path + 2 retries, then healthy
+
+    monkeypatch.setattr(cli, "probe_cdp", fake_probe)
+    return slots, calls
+
+
+def test_ensure_chrome_recovers_when_only_own_slot_held(tmp_path, monkeypatch):
+    slots, calls = _wire_recovery(monkeypatch, tmp_path)
+    fd0 = _hold(slots / "slot-0.lock")  # this worker's own slot
+    try:
+        # Wedged CDP + only our own slot held → must NOT raise; must relaunch.
+        result = cli.ensure_shared_chrome_running(skip_slot_id=0)
+    finally:
+        _release(fd0)
+    assert result is True            # performed the launch (owner return)
+    assert calls["kill"] == 1
+    assert calls["popen"] == 1
+
+
+def test_ensure_chrome_refuses_when_sibling_slot_held(tmp_path, monkeypatch):
+    slots, calls = _wire_recovery(monkeypatch, tmp_path)
+    fd0 = _hold(slots / "slot-0.lock")  # own
+    fd1 = _hold(slots / "slot-1.lock")  # a genuinely-active sibling
+    try:
+        with pytest.raises(RuntimeError, match="other workers hold ParallelSlots"):
+            cli.ensure_shared_chrome_running(skip_slot_id=0)
+    finally:
+        _release(fd0, fd1)
+    assert calls["kill"] == 0         # never killed Chrome out from under the sibling
+    assert calls["popen"] == 0

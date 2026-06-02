@@ -1040,11 +1040,15 @@ class ParallelSlot:
     On enter, tries non-blocking LOCK_EX on slot files 0..N-1 in order; if all
     are taken, polls every 2s. Emits one `slot_queued` JSONL line when waiting
     starts and a `slot_acquired` line on success with the wait duration.
+
+    `slot_id` is public: the worker passes it to `ensure_shared_chrome_running`
+    so a wedged-Chrome recovery can skip its own slot (see `_slots_held`). It is
+    None before acquisition and after release.
     """
     def __init__(self, max_parallel: int):
         self.max_parallel = max_parallel
         self._fd = None
-        self._slot_id = None
+        self.slot_id = None
 
     def __enter__(self):
         SLOT_LOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -1062,7 +1066,7 @@ class ParallelSlot:
                     fd.close()
                     raise
                 self._fd = fd
-                self._slot_id = slot_id
+                self.slot_id = slot_id
                 log_stage(
                     "slot_acquired",
                     slot_id=slot_id,
@@ -1083,7 +1087,7 @@ class ParallelSlot:
         finally:
             self._fd.close()
             self._fd = None
-            self._slot_id = None
+            self.slot_id = None
 
 
 async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
@@ -1103,7 +1107,9 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
 
     log_stage("start", run_id=run_id)
     with ParallelSlot(get_max_parallel()) as slot:
-        return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot._slot_id)
+        # Pass our own slot id so a wedged-Chrome recovery skips it — otherwise
+        # the worker counts its own held slot and never recovers (see _slots_held).
+        return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot.slot_id)
 
 
 async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot_id) -> dict:
