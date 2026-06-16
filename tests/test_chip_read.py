@@ -104,3 +104,23 @@ async def test_oscillating_chip_times_out_empty():
     text = await read_composer_chip_text(page, timeout=0.05, stable_polls=3)
     assert text == ""
     assert not is_pro_extended_label(text)
+
+
+def test_pro_extended_label_passes_predicate():
+    # The 2026-06 redesign flipped the selected-chip label from "Extended Pro"
+    # to "Pro Extended" (the flat Intelligence list's tier name). Both contain
+    # the "Pro" + "Extended" tokens, so the fail-closed predicate accepts it.
+    assert is_pro_extended_label("Pro Extended")
+
+
+def test_pro_extended_only_is_ambiguous_without_pro_token():
+    # A bare "Extended" (e.g. a thinking-model effort tier) lacks "Pro" and must
+    # still fail closed.
+    assert not is_pro_extended_label("Extended")
+
+
+async def test_steady_pro_extended_passes():
+    page = _FakePage(["Model", "Pro Extended", "Pro Extended", "Pro Extended"])
+    text = await read_composer_chip_text(page, timeout=1.0, stable_polls=3)
+    assert text == "Pro Extended"
+    assert is_pro_extended_label(text)

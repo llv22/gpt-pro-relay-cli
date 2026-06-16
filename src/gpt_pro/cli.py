@@ -478,14 +478,17 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
     return ""
 
 
-# The Effort submenu trigger inside the chip menu. Two "Effort" buttons share
-# the same accessible name (one per model row) — disambiguation is by testid.
-# The button is rendered as a "trailing button" with Tailwind `invisible` and
-# its container is `pointer-events-none` until the parent row is hovered, so
-# Playwright's hover/click won't reach it. We bypass with a synthetic
-# HTMLElement.click() via evaluate() — Radix's submenu state is wired to the
-# click handler, not pointer events, so the synthetic click opens it cleanly.
-PRO_EFFORT_TRIGGER_TESTID = "model-switcher-gpt-5-5-pro-thinking-effort"
+# The Pro Extended reasoning tier is a direct leaf in the chip menu. The
+# 2026-06 redesign flattened the old two-level model-row -> "Effort" submenu
+# into a single "Intelligence" list whose rows are the effort tiers themselves
+# (Instant / Medium / High / Extra High / Pro Extended), each a
+# role='menuitemradio'. "Pro Extended" is GPT-5.5 Pro + Extended reasoning and
+# the only tier that maps to the gpt-5-5-pro slug — selecting it flips the chip
+# to the stable label "Pro Extended" (matches is_pro_extended_label). The
+# radio carries no data-testid, so we match on its exact visible text. (The old
+# `model-switcher-gpt-5-5-pro-thinking-effort` trigger and its group-hover
+# synthetic-click dance are gone with the redesign.)
+PRO_EXTENDED_LABEL = "Pro Extended"
 
 
 async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
@@ -495,13 +498,11 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
     we no-op without taking any lock — the typical case.
 
     Slow path (chip in a wrong state): held under `UiClipboardLock` plus a
-    `bring_tab_to_front` because the chip menu and its submenu are focus-
-    sensitive Radix portals, and `keyboard.press("Escape")` on cleanup paths
-    can close the wrong menu if a concurrent worker brings its tab to front.
-    The slow path opens the chip menu, synthetically clicks the Pro Effort
-    submenu trigger (hidden behind a group-hover affordance — see
-    PRO_EFFORT_TRIGGER_TESTID docstring), then clicks the "Extended" leaf
-    (role='menuitemradio', not menuitem).
+    `bring_tab_to_front` because the chip menu is a focus-sensitive Radix portal,
+    and `keyboard.press("Escape")` on cleanup paths can close the wrong menu if a
+    concurrent worker brings its tab to front. The slow path opens the chip menu
+    and clicks the "Pro Extended" leaf (role='menuitemradio') directly — the
+    redesigned menu is flat, so there is no submenu to navigate.
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
@@ -521,42 +522,12 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
             log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
             return False, text
 
-        # Capture the menu-count baseline so we can detect the *new* menu the
-        # trigger click mounts (avoids racing with unrelated portal menus that may
-        # already be mounted on the page).
-        baseline_menu_count = await page.evaluate(
-            "() => document.querySelectorAll('[role=\"menu\"]').length"
-        )
-
-        trigger = page.locator(f'[data-testid="{PRO_EFFORT_TRIGGER_TESTID}"]').first
-        try:
-            await trigger.wait_for(state="attached", timeout=3000)
-            await trigger.evaluate("el => el.click()")
-        except Exception as e:
-            await safe_screenshot(page, run_dir / "error-chip_pro_trigger.png")
-            (run_dir / "error.html").write_text(await page.content())
-            log_stage("error", reason="pro_effort_trigger_click_failed", exception=f"{type(e).__name__}: {e}")
-            await page.keyboard.press("Escape")
-            return False, text
-
-        try:
-            await page.wait_for_function(
-                f"document.querySelectorAll('[role=\"menu\"]').length > {baseline_menu_count}",
-                timeout=3000,
-            )
-        except Exception as e:
-            await safe_screenshot(page, run_dir / "error-chip_submenu_open.png")
-            (run_dir / "error.html").write_text(await page.content())
-            log_stage("error", reason="pro_effort_submenu_open_failed", exception=f"{type(e).__name__}: {e}")
-            await page.keyboard.press("Escape")
-            return False, text
-
-        # Scope the Extended lookup to the newest-mounted menu (the submenu the
-        # trigger just opened). Leaves are role='menuitemradio'. Anchor the regex
-        # so future variants like "Extended+" or "Extended (beta)" don't silently
-        # match — those would be intentional product changes worth reviewing.
-        submenu = page.locator('[role="menu"]').last
-        item = submenu.get_by_role("menuitemradio", name=re.compile(rf"^{EXTENDED_TOKEN}$"))
+        # The chip menu is the newest-mounted [role=menu]. "Pro Extended" is a
+        # direct menuitemradio leaf — anchor the regex so a future "Pro Extended+"
+        # or relabel doesn't silently match (an intentional product change worth
+        # reviewing rather than auto-accepting).
+        menu = page.locator('[role="menu"]').last
+        item = menu.get_by_role("menuitemradio", name=re.compile(rf"^{re.escape(PRO_EXTENDED_LABEL)}$"))
         try:
             await item.first.click(timeout=5000)
         except Exception as e:
@@ -566,14 +537,14 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
             await page.keyboard.press("Escape")
             return False, text
 
-        # Poll up to 5s for the chip text to update. The post-click confirmation is
-        # looser than the fast-path predicate: we already navigated through Pro's
-        # submenu, so any "Extended"-containing label proves the click took effect.
+        # Poll up to 5s for the chip text to update. We just clicked the
+        # "Pro Extended" leaf, so confirm with the full fail-closed predicate
+        # (both "Pro" and "Extended") — the post-click label is "Pro Extended".
         deadline = time.time() + 5.0
         final_text = text
         while time.time() < deadline:
             final_text = (await chip.inner_text()).strip()
-            if EXTENDED_TOKEN in final_text:
+            if is_pro_extended_label(final_text):
                 return True, final_text
             await asyncio.sleep(0.2)
         return False, final_text
