@@ -23,7 +23,7 @@ SESSION_COOKIE_PREFIX = "__Secure-next-auth.session-token"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
-DEFAULT_MAX_PARALLEL = 3
+DEFAULT_MAX_PARALLEL = 6
 MAX_PROMPT_BYTES = 1_000_000
 
 CHROME_APP = "/Applications/Google Chrome.app"

@@ -79,7 +79,7 @@ RUN_ID=$(uuidgen)
 echo "your prompt" | gpt-pro-relay ask --run-id "$RUN_ID"
 ```
 
-If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo` or call the venv binary directly. Up to `GPT_PRO_MAX_PARALLEL` (default 3) concurrent runs share one Chrome process; beyond that they queue on a file-lock semaphore in `~/.gpt-pro/slots/`.
+If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo` or call the venv binary directly. Up to `GPT_PRO_MAX_PARALLEL` (default 6) concurrent runs share one Chrome process; beyond that they queue on a file-lock semaphore in `~/.gpt-pro/slots/`.
 
 ### Remote (SSH)
 
@@ -150,7 +150,7 @@ Each run writes to `~/.gpt-pro/runs/<run_id>/`:
 
 ## Concurrency
 
-Up to `GPT_PRO_MAX_PARALLEL` (default 3) `ask` invocations run in parallel — each gets its own tab in a shared Chrome process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). Chrome stays alive between runs; `gpt-pro-relay close-chrome` tears it down when no workers are in flight.
+Up to `GPT_PRO_MAX_PARALLEL` (default 6) `ask` invocations run in parallel — each gets its own tab in a shared Chrome process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). Chrome stays alive between runs; `gpt-pro-relay close-chrome` tears it down when no workers are in flight.
 
 ## Known limitations
 - Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
