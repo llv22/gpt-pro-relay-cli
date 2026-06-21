@@ -11,7 +11,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 PROFILE = Path.home() / ".gpt-pro-profile"
 STATE = Path.home() / ".gpt-pro"
@@ -25,6 +25,13 @@ RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
 DEFAULT_MAX_PARALLEL = 6
 MAX_PROMPT_BYTES = 1_000_000
+# Initial chatgpt.com navigation. Playwright's implicit 30s default clipped
+# slow-but-working loads during transient server/Cloudflare windows (runs
+# 5939ab6e/6489a9e7/bf35b1f8 on 2026-06-21 all died on `Page.goto` at 30s while
+# identical prompts navigated in ~7s minutes later). 90s rides out the transient;
+# one retry covers a first-attempt blip. Tune via the `goto_retry` JSONL signal.
+DEFAULT_GOTO_TIMEOUT_MS = 90_000
+DEFAULT_GOTO_RETRIES = 1
 
 CHROME_APP = "/Applications/Google Chrome.app"
 LAUNCH_DEBUG_PORT = 19222
@@ -1083,6 +1090,34 @@ async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
         return await _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot.slot_id)
 
 
+async def _goto_with_retry(
+    page,
+    url: str,
+    *,
+    timeout_ms: int = DEFAULT_GOTO_TIMEOUT_MS,
+    retries: int = DEFAULT_GOTO_RETRIES,
+) -> None:
+    """Navigate to `url`, retrying only on Playwright TimeoutError.
+
+    This is a PRE-SEND navigation retry: no prompt is typed and no Pro reasoning
+    is consumed, so it sits outside the "no auto-retry on submitted prompts"
+    invariant (which exists to avoid re-burning 5-20 min of reasoning on a sent
+    prompt). The catch is scoped to TimeoutError on purpose — a fast connection
+    error, CDP disconnect, or auth-redirect navigation error is a different
+    failure class that must surface immediately, not be masked behind retries.
+    Exhausting the retry budget re-raises, so the worker still fails closed
+    (-> worker_exception, run_dir surfaced).
+    """
+    for attempt in range(retries + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except PlaywrightTimeoutError:
+            if attempt >= retries:
+                raise
+            log_stage("goto_retry", url=url, attempt=attempt + 1, timeout_ms=timeout_ms)
+
+
 async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot_id) -> dict:
     def exc(e: Exception) -> dict:
         return err("worker_exception", {"exception": f"{type(e).__name__}: {e}"})
@@ -1107,7 +1142,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 page.on("response", lambda r: asyncio.create_task(_log_response(r, network_log)))
                 log_stage("chrome_connected")
 
-                await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+                await _goto_with_retry(page, "https://chatgpt.com/")
                 await pin_viewport_cdp(ctx, page)
                 if not await wait_for_login(ctx, timeout=30.0):
                     await safe_screenshot(page, run_dir / "error-needs_reauth.png")
