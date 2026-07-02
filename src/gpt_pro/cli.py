@@ -24,7 +24,7 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 RUN_ID_MAX_LEN = 100
 DEFAULT_GENERATION_TIMEOUT = 60 * 60
 DEFAULT_MAX_PARALLEL = 6
-MAX_PROMPT_BYTES = 1_000_000
+MAX_PROMPT_BYTES = 5_000_000
 # Initial chatgpt.com navigation. Playwright's implicit 30s default clipped
 # slow-but-working loads during transient server/Cloudflare windows (runs
 # 5939ab6e/6489a9e7/bf35b1f8 on 2026-06-21 all died on `Page.goto` at 30s while
