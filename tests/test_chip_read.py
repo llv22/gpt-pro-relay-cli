@@ -19,7 +19,13 @@ a lower tier, so the stability requirement still applies.
 import pytest
 
 from gpt_pro import cli
-from gpt_pro.cli import classify_model_status, is_pro_label, read_composer_chip_text
+from gpt_pro.cli import (
+    classify_model_status,
+    classify_served_audit,
+    doctor_exit_ok,
+    is_pro_label,
+    read_composer_chip_text,
+)
 
 
 class _FakeChip:
@@ -144,3 +150,41 @@ def test_classify_model_status():
     # so a flaky Radix read never fails doctor on its own.
     assert classify_model_status(None) == "unknown"
     assert not classify_model_status(None).startswith("unexpected")
+
+
+def test_doctor_exit_ok_requires_positive_confirmation():
+    # Green ONLY when login + Pro effort chip + Sol model are all confirmed.
+    assert doctor_exit_ok(True, "ok", "ok")
+    # A confirmed wrong effort or wrong model is red.
+    assert not doctor_exit_ok(True, "unexpected: 'High'", "ok")
+    assert not doctor_exit_ok(True, "ok", "unexpected: 'GPT-5.5'")
+    # An UNconfirmable chip/model (read failed or menu unreadable) is red too —
+    # doctor must not report green when it couldn't actually verify the setup.
+    assert not doctor_exit_ok(True, "ok", "unknown")
+    assert not doctor_exit_ok(True, "ok", "failed: TimeoutError: x")
+    assert not doctor_exit_ok(True, "failed: TimeoutError: x", "ok")
+    # Not logged in is red regardless of the skipped checks.
+    assert not doctor_exit_ok(False, "skipped", "skipped")
+
+
+def test_classify_served_audit():
+    # Present slug is authoritative (encodes model + effort).
+    assert classify_served_audit("gpt-5-6-pro", None) == "verified"
+    # A present non-allowlisted slug is fatal — including a Sol effort DOWNGRADE
+    # (High effort stamps gpt-5-6-thinking) and any older model.
+    assert classify_served_audit("gpt-5-6-thinking", None) == "slug_mismatch"
+    assert classify_served_audit("gpt-5-5-pro", None) == "slug_mismatch"
+    # Missing slug → fall back to the read-only menu model read.
+    assert classify_served_audit(None, "GPT-5.6 Sol") == "model_ok_slug_missing"
+    assert classify_served_audit(None, "GPT-5.5") == "menu_mismatch"  # fatal
+    # Missing slug AND unreadable menu → documented fail-open (never bricks).
+    assert classify_served_audit(None, None) == "unverified_missing_slug"
+    # An EMPTY-string slug is treated as missing (served_assistant_model_slug can
+    # return ""), so the menu fallback still guards it.
+    assert classify_served_audit("", None) == "unverified_missing_slug"
+    assert classify_served_audit("", "GPT-5.5") == "menu_mismatch"
+    # Only "slug_mismatch"/"menu_mismatch" are the fatal verdicts.
+    fatal = {"slug_mismatch", "menu_mismatch"}
+    assert classify_served_audit("gpt-5-6-pro", None) not in fatal
+    assert classify_served_audit(None, "GPT-5.6 Sol") not in fatal
+    assert classify_served_audit(None, None) not in fatal

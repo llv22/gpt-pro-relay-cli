@@ -419,9 +419,12 @@ PRO_TOKEN = "Pro"
 # wrongly accept a hypothetical non-Pro "gpt-5-6-mini". If OpenAI ships a new
 # Pro-family slug, add it here — a one-line, deliberate edit. NOTE the UI display
 # name and the slug diverge: "GPT-5.6 Sol" + Pro effort serves as `gpt-5-6-pro`
-# (verified 2026-07-09 via a live send). The audit verifies the *model* only; the
-# pre-send chip ("Pro") is the sole signal for the reasoning *effort* — a
-# server-side effort downgrade with the Pro model intact is a documented risk.
+# (verified 2026-07-09 via a live send). The served slug encodes the effort tier
+# too, not just the model: Sol at Pro effort → `gpt-5-6-pro`, but Sol at High
+# effort → `gpt-5-6-thinking` (measured 2026-07-09). So on a *present* slug the
+# audit catches an effort downgrade as well as a model swap — only Pro-on-Sol
+# maps into this allowlist. The pre-send chip ("Pro") is a fast fail; the slug is
+# authoritative. The one thing neither can see is a *missing* slug (fail-open).
 PRO_MODEL_SLUGS = frozenset({"gpt-5-6-pro"})
 
 
@@ -575,13 +578,46 @@ SOL_MODEL_TOKEN = "Sol"  # distinctive substring: no other model row contains it
 
 def classify_model_status(model_text: str | None) -> str:
     """Classify a read model label for `doctor`. `None` (unreadable menu) →
-    "unknown" (degraded, not fatal); a label containing "Sol" → "ok"; anything
-    else → "unexpected: <label>" (a confirmed wrong model, which fails doctor)."""
+    "unknown"; a label containing "Sol" → "ok"; anything else →
+    "unexpected: <label>" (a confirmed wrong model)."""
     if model_text is None:
         return "unknown"
     if SOL_MODEL_TOKEN in model_text:
         return "ok"
     return f"unexpected: {model_text!r}"
+
+
+def doctor_exit_ok(logged_in: bool, chip_status: str, model_status: str) -> bool:
+    """`doctor` succeeds only when login, the Pro-effort chip, AND the Sol model
+    are all POSITIVELY confirmed ("ok"). Anything else — a wrong effort/model
+    ("unexpected: ..."), an unreadable chip/menu ("unknown"/"failed"), or the
+    not-logged-in "skipped" — is NOT a confirmation, so doctor goes red. doctor
+    is a diagnostic, not the hot path: a read failure surfacing as non-green (the
+    operator re-runs) is correct, whereas a false green would defeat doctor's
+    whole purpose of catching a setup drifted off GPT-5.6 Sol + Pro."""
+    return logged_in and chip_status == "ok" and model_status == "ok"
+
+
+def classify_served_audit(served_slug: str | None, menu_model: str | None) -> str:
+    """Post-send model audit verdict. The served `data-message-model-slug` is
+    authoritative (it encodes model *and* effort tier), but only exists on a
+    stamped turn. When it's absent, `menu_model` (a read-only chip-menu model
+    read, the fallback) is the independent backstop. Verdicts:
+
+    - "verified"            — slug present and in `PRO_MODEL_SLUGS` (Sol+Pro).
+    - "slug_mismatch"       — slug present but not allowlisted → FATAL.
+    - "menu_mismatch"       — slug absent, menu confirms a non-Sol model → FATAL
+                              (closes the missing-slug wrong-model hole).
+    - "model_ok_slug_missing" — slug absent, menu confirms Sol → fail-OPEN, but
+                              model is confirmed (effort stays unverified).
+    - "unverified_missing_slug" — slug absent AND menu unreadable → fail-OPEN
+                              (a double selector break must not brick the tool).
+    """
+    if served_slug:
+        return "verified" if served_slug in PRO_MODEL_SLUGS else "slug_mismatch"
+    if menu_model is None:
+        return "unverified_missing_slug"
+    return "model_ok_slug_missing" if SOL_MODEL_TOKEN in menu_model else "menu_mismatch"
 
 
 async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
@@ -670,17 +706,17 @@ async def cmd_doctor() -> int:
                 except Exception as e:
                     chip_status = f"failed: {type(e).__name__}: {e}"
                 # Read the selected model (read-only) so a default drifted off Sol
-                # is visible — the effort chip alone can't reveal it. A confirmed
-                # wrong model fails doctor; an unreadable menu degrades to
-                # "unknown" (not fatal), matching the served-slug fail-open.
+                # is visible — the effort chip alone can't reveal it.
                 try:
                     model_text = await read_selected_model(page, timeout=10.0)
                     model_status = classify_model_status(model_text)
                 except Exception as e:
                     model_status = f"failed: {type(e).__name__}: {e}"
-            model_ok = not model_status.startswith("unexpected")
+            # doctor is green ONLY when login + Pro effort + Sol model are all
+            # positively confirmed; a wrong OR unconfirmable chip/model is red.
+            checks_ok = doctor_exit_ok(ok, chip_status, model_status)
             result = {
-                "status": "ok" if (ok and model_ok) else ("needs_reauth" if not ok else "model_mismatch"),
+                "status": "ok" if checks_ok else ("needs_reauth" if not ok else "misconfigured"),
                 "url": page.url,
                 "chip": chip_status,
                 "chip_text": chip_text,
@@ -694,7 +730,7 @@ async def cmd_doctor() -> int:
             except Exception:
                 pass
     print(json.dumps(result, indent=2))
-    return 0 if (ok and model_ok) else 1
+    return 0 if checks_ok else 1
 
 
 # ---- login ----
@@ -1371,29 +1407,40 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 served_slug = await served_assistant_model_slug(page)
                 log_stage("served_model", slug=served_slug)
 
-                # A *present* slug naming a non-Pro model (anything but
-                # gpt-5-6-pro) is authoritative contamination — fail closed
-                # regardless of `completed`, so a timed-out non-Pro turn is never
-                # quietly reported as a plain timeout. response.md is kept as a
-                # diagnostic artifact; the result is an error so it is never
-                # printed as a success.
-                if served_slug and served_slug not in PRO_MODEL_SLUGS:
-                    await safe_screenshot(page, run_dir / "error-served_model_mismatch.png")
-                    log_stage("error", reason="served_model_mismatch", slug=served_slug)
-                    return err("served_model_mismatch",
-                               {"served_slug": served_slug, "completed": completed,
-                                "response_chars": len(response)})
+                # When the authoritative slug is ABSENT (attribute rename / not
+                # stamped), the chip proves neither model nor effort, so fall back
+                # to an independent read-only chip-menu model read — the same
+                # signal `doctor` uses. This closes the missing-slug wrong-model
+                # hole without bricking on a slug rename: only a *confirmed* non-Sol
+                # model is fatal; Sol or an unreadable menu preserves the fail-open.
+                menu_model = None
+                if not served_slug:
+                    menu_model = await read_selected_model(page, timeout=10.0)
+                model_audit = classify_served_audit(served_slug, menu_model)
 
-                # A *missing* slug (selector drift / not-yet-rendered) degrades
-                # fail-OPEN — making it fatal would brick the tool on a single
-                # attribute rename, the exact blast radius the network-body-gate
-                # alternative was rejected for. But mark it explicitly so a caller
-                # can't mistake an unaudited answer for a verified one, and emit a
-                # distinct stage so selector drift is greppable, not blended into
-                # the normal served_model line.
-                model_audit = "verified" if served_slug in PRO_MODEL_SLUGS else "unverified_missing_slug"
+                # A present non-Pro slug, OR a missing slug whose menu fallback
+                # confirms a non-Sol model, is authoritative contamination — fail
+                # closed regardless of `completed`, so a timed-out wrong-model turn
+                # is never quietly reported as a plain timeout. response.md is kept
+                # as a diagnostic artifact; the result is an error so it is never
+                # printed as a success.
+                if model_audit in ("slug_mismatch", "menu_mismatch"):
+                    reason = "served_model_mismatch" if model_audit == "slug_mismatch" else "model_menu_mismatch"
+                    await safe_screenshot(page, run_dir / f"error-{reason}.png")
+                    log_stage("error", reason=reason, slug=served_slug, menu_model=menu_model)
+                    return err(reason,
+                               {"served_slug": served_slug, "menu_model": menu_model,
+                                "completed": completed, "response_chars": len(response)})
+
+                # Remaining non-"verified" verdicts are fail-OPEN — a missing slug
+                # (even with the menu confirming Sol) leaves the *effort* unverified,
+                # and a double selector break leaves everything unverified. Making
+                # these fatal would brick the tool on a single attribute rename, the
+                # exact blast radius the network-body-gate alternative was rejected
+                # for. Mark them explicitly so a caller can't mistake an unaudited
+                # answer for a verified one, and emit a distinct greppable stage.
                 if completed and model_audit != "verified":
-                    log_stage("served_model_unverified")
+                    log_stage("served_model_unverified", model_audit=model_audit)
 
                 result = {
                     "status": "ok" if completed else "timeout",
