@@ -7,12 +7,19 @@ read_composer_chip_text returned the *first* non-placeholder value it saw,
 catching the optimistic-hydration transient. These tests pin the stability
 behavior that fixes it: the chip text must repeat for `stable_polls` reads
 before it is trusted.
+
+Since the 2026-07 GPT-5.6 redesign the chip shows the reasoning-EFFORT tier
+only (Instant / Medium / High / Extra High / Pro); the model ("GPT-5.6 Sol",
+served slug gpt-5-6-pro) is a separate axis verified post-send. The predicate
+`is_pro_label` accepts any chip containing the "Pro" (top-tier) token; the same
+optimistic-hydrate → re-resolve race can now drift the effort from "Pro" down to
+a lower tier, so the stability requirement still applies.
 """
 
 import pytest
 
 from gpt_pro import cli
-from gpt_pro.cli import is_pro_extended_label, read_composer_chip_text
+from gpt_pro.cli import is_pro_label, read_composer_chip_text
 
 
 class _FakeChip:
@@ -60,29 +67,29 @@ def _no_sleep(monkeypatch):
 
 
 async def test_optimistic_transient_is_rejected():
-    # The exact failure shape: hydrates to "Extended Pro", then settles to
-    # "Thinking". The stable read must return the SETTLED value, not the
+    # The exact failure shape: hydrates to "Pro", then settles to a lower effort
+    # tier ("High"). The stable read must return the SETTLED value, not the
     # transient — so the fast path fails and the slow path corrects it.
-    page = _FakePage(["Model", "Extended Pro", "Thinking", "Thinking", "Thinking"])
+    page = _FakePage(["Model", "Pro", "High", "High", "High"])
     text = await read_composer_chip_text(page, timeout=30.0)
-    assert text == "Thinking"
-    assert not is_pro_extended_label(text)
+    assert text == "High"
+    assert not is_pro_label(text)
 
 
-async def test_steady_extended_pro_passes():
-    page = _FakePage(["Model", "Extended Pro", "Extended Pro", "Extended Pro"])
+async def test_steady_pro_passes():
+    page = _FakePage(["Model", "Pro", "Pro", "Pro"])
     text = await read_composer_chip_text(page, timeout=30.0)
-    assert text == "Extended Pro"
-    assert is_pro_extended_label(text)
+    assert text == "Pro"
+    assert is_pro_label(text)
 
 
 async def test_stable_polls_one_is_eager():
     # The slow-path post-click confirmation wants the old eager behavior:
     # return the first non-placeholder value (no hydration race after a
     # deliberate menu click).
-    page = _FakePage(["Model", "Extended", "Extended"])
+    page = _FakePage(["Model", "Pro", "Pro"])
     text = await read_composer_chip_text(page, timeout=30.0, stable_polls=1)
-    assert text == "Extended"
+    assert text == "Pro"
 
 
 async def test_never_hydrates_returns_empty():
@@ -91,36 +98,36 @@ async def test_never_hydrates_returns_empty():
     page = _FakePage(["Model"])
     text = await read_composer_chip_text(page, timeout=0.05)
     assert text == ""
-    assert not is_pro_extended_label(text)
+    assert not is_pro_label(text)
 
 
 async def test_oscillating_chip_times_out_empty():
     # A chip that never holds one value for `stable_polls` consecutive reads
     # must NOT be accepted on the last lucky sample (the original timeout
-    # fail-open). It oscillates Extended Pro <-> Thinking forever, so the read
-    # times out and returns "" -> fails closed, even though a transient
-    # "Extended Pro" was seen on every other poll.
-    page = _FakePage(["Extended Pro", "Thinking"])
+    # fail-open). It oscillates Pro <-> High forever, so the read times out and
+    # returns "" -> fails closed, even though a transient "Pro" was seen on
+    # every other poll.
+    page = _FakePage(["Pro", "High"])
     text = await read_composer_chip_text(page, timeout=0.05, stable_polls=3)
     assert text == ""
-    assert not is_pro_extended_label(text)
+    assert not is_pro_label(text)
 
 
-def test_pro_extended_label_passes_predicate():
-    # The 2026-06 redesign flipped the selected-chip label from "Extended Pro"
-    # to "Pro Extended" (the flat Intelligence list's tier name). Both contain
-    # the "Pro" + "Extended" tokens, so the fail-closed predicate accepts it.
-    assert is_pro_extended_label("Pro Extended")
+def test_pro_label_passes_predicate():
+    # The 2026-07 redesign renders the selected top-tier effort as the bare
+    # label "Pro" (contains the "Pro" token).
+    assert is_pro_label("Pro")
 
 
-def test_pro_extended_only_is_ambiguous_without_pro_token():
-    # A bare "Extended" (e.g. a thinking-model effort tier) lacks "Pro" and must
-    # still fail closed.
-    assert not is_pro_extended_label("Extended")
+def test_lower_effort_tiers_fail_predicate():
+    # Every non-Pro effort tier lacks the "Pro" token and must fail closed.
+    for label in ("Instant", "Medium", "High", "Extra High", "Model", ""):
+        assert not is_pro_label(label)
+    assert not is_pro_label(None)
 
 
-async def test_steady_pro_extended_passes():
-    page = _FakePage(["Model", "Pro Extended", "Pro Extended", "Pro Extended"])
+async def test_steady_pro_passes_with_explicit_stable_polls():
+    page = _FakePage(["Model", "Pro", "Pro", "Pro"])
     text = await read_composer_chip_text(page, timeout=1.0, stable_polls=3)
-    assert text == "Pro Extended"
-    assert is_pro_extended_label(text)
+    assert text == "Pro"
+    assert is_pro_label(text)

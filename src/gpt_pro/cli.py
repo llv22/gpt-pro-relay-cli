@@ -213,7 +213,7 @@ def probe_cdp(port: int, *, timeout: float = 1.0) -> bool:
     The default 1s is for the fast-path (everything's healthy and the request
     returns instantly). Use a longer timeout (e.g. 3s) inside LaunchLock when
     deciding whether to kill processes — under heavy CPU contention from
-    multiple in-flight Pro Extended renderers, a healthy Chrome can take >1s
+    multiple in-flight Pro renderers, a healthy Chrome can take >1s
     to respond and we don't want to falsely declare it orphaned.
     """
     try:
@@ -401,40 +401,42 @@ async def is_logged_in(ctx) -> bool:
     return any(c["name"].startswith(SESSION_COOKIE_PREFIX) for c in cookies)
 
 
-# Composer chip combines model + reasoning. The chip exposes no model-axis
-# signal beyond the visible label (no aria-label, no dataset, no hidden mirror
-# that differs from innerText), so a label of just "Extended" is ambiguous —
-# it could be Pro+Extended (truncated) or Thinking+Extended. We require *both*
-# "Extended" and "Pro" in the text (see `is_pro_extended_label`). Observed
-# label variants: "Extended", "Extended Pro" — the truncation flips with A/B
-# tests and the chip's responsive classes (`max-w-40 truncate`,
-# `[[data-collapse-labels]_&]:sr-only`).
+# Composer chip shows the reasoning-EFFORT tier only. Since the 2026-07 GPT-5.6
+# redesign the model and effort are separate axes: the chip renders the effort
+# tier (Instant / Medium / High / Extra High / Pro) and the model lives on its
+# own submenu ("GPT-5.6 Sol"). The desired effort is the top "Pro" tier, which
+# the chip renders as the bare label "Pro". The chip exposes NO model-axis signal
+# (no aria-label, no dataset, no hidden mirror that differs from innerText), so
+# the model is invisible here — the pre-send chip verifies the *effort* and the
+# post-send served-slug audit verifies the *model*. See `is_pro_label`.
 COMPOSER_CHIP = 'button.__composer-pill[aria-haspopup="menu"]'
-EXTENDED_TOKEN = "Extended"
-# Ground-truth model slugs stamped on the served assistant turn
+PRO_TOKEN = "Pro"
+# Ground-truth model slug stamped on the served assistant turn
 # (data-message-model-slug). This is the only *authoritative* model signal, but
 # it only exists after Send, so it backstops the pre-send chip gate rather than
 # replacing it. See served_assistant_model_slug / the post-completion audit.
-# An explicit allowlist (not a prefix test): a prefix like "gpt-5-5-pro" would
-# wrongly accept a hypothetical "gpt-5-5-pro-thinking". If OpenAI ships a new
-# Pro-family slug, add it here — a one-line, deliberate edit. Note the audit
-# verifies the *model* only; the pre-send chip (requiring both "Extended" and
-# "Pro") remains the sole signal for the reasoning *effort* — a server-side
-# effort downgrade with the Pro model intact is a documented residual risk.
-PRO_MODEL_SLUGS = frozenset({"gpt-5-5-pro"})
+# An explicit allowlist (not a prefix test): a prefix like "gpt-5-6" would
+# wrongly accept a hypothetical non-Pro "gpt-5-6-mini". If OpenAI ships a new
+# Pro-family slug, add it here — a one-line, deliberate edit. NOTE the UI display
+# name and the slug diverge: "GPT-5.6 Sol" + Pro effort serves as `gpt-5-6-pro`
+# (verified 2026-07-09 via a live send). The audit verifies the *model* only; the
+# pre-send chip ("Pro") is the sole signal for the reasoning *effort* — a
+# server-side effort downgrade with the Pro model intact is a documented risk.
+PRO_MODEL_SLUGS = frozenset({"gpt-5-6-pro"})
 
 
-def is_pro_extended_label(text: str | None) -> bool:
-    """Predicate: chip text unambiguously indicates Pro + Extended reasoning.
+def is_pro_label(text: str | None) -> bool:
+    """Predicate: chip text indicates the top "Pro" reasoning-effort tier.
 
-    Requires *both* "Extended" and "Pro" tokens. The chip exposes no model-axis
-    signal beyond the visible label (no aria-label, no dataset, no hidden mirror
-    that differs from innerText), so a label of just "Extended" is ambiguous —
-    it could be Pro+Extended (truncated) or Thinking+Extended. Demanding "Pro"
-    too closes that fail-closed gap. The post-click confirmation in
-    ensure_extended_chip can be looser since we know which submenu we picked.
+    The composer chip shows the effort tier only (Instant / Medium / High /
+    Extra High / Pro). "Pro" is the highest tier and the only one containing the
+    "Pro" token, so a substring test uniquely identifies it — model names never
+    appear in the chip. This verifies *effort*, not model: the model
+    ("GPT-5.6 Sol", served slug gpt-5-6-pro) is verified post-send by the
+    served-slug audit. Substring (not exact) matching per the redesign-resilience
+    convention — ChatGPT relabels this chip across redesigns.
     """
-    return bool(text) and EXTENDED_TOKEN in text and "Pro" in text
+    return bool(text) and PRO_TOKEN in text
 
 
 SSR_CHIP_PLACEHOLDER = "Model"  # Server-rendered text before React hydrates the user's actual selection.
@@ -444,7 +446,7 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
     """Read the composer chip's text after React hydration *and* settle.
 
     The chip's SSR text is 'Model'; hydration replaces it with the user's
-    selected mode ('Extended', 'Extended Pro', 'Auto', etc.). We poll until the
+    selected effort tier ('Pro', 'High', 'Auto', etc.). We poll until the
     placeholder is gone — reading too early would cause a self-correction click
     on an unhydrated chip, which doesn't open the menu.
 
@@ -480,40 +482,48 @@ async def read_composer_chip_text(page, *, timeout: float = 30.0, stable_polls: 
             last = ""
         await asyncio.sleep(0.2)
     # Timed out without `stable_polls` consecutive identical reads: the chip
-    # never settled. Return "" (not the last transient) so is_pro_extended_label
+    # never settled. Return "" (not the last transient) so is_pro_label
     # fails closed — an oscillating chip must not be accepted as verified.
     return ""
 
 
-# The Pro Extended reasoning tier is a direct leaf in the chip menu. The
-# 2026-06 redesign flattened the old two-level model-row -> "Effort" submenu
-# into a single "Intelligence" list whose rows are the effort tiers themselves
-# (Instant / Medium / High / Extra High / Pro Extended), each a
-# role='menuitemradio'. "Pro Extended" is GPT-5.5 Pro + Extended reasoning and
-# the only tier that maps to the gpt-5-5-pro slug — selecting it flips the chip
-# to the stable label "Pro Extended" (matches is_pro_extended_label). The
-# radio carries no data-testid, so we match on its exact visible text. (The old
-# `model-switcher-gpt-5-5-pro-thinking-effort` trigger and its group-hover
-# synthetic-click dance are gone with the redesign.)
-PRO_EXTENDED_LABEL = "Pro Extended"
+# The 2026-07 GPT-5.6 redesign split the chip menu into two axes. The flat
+# "Intelligence" list (data-testid="composer-intelligence-picker-content") holds
+# the effort tiers — Instant / Medium / High / Extra High / Pro — each a
+# role='menuitemradio' with a plain-text label; "Pro" is the top tier and maps
+# to the gpt-5-6-pro served slug. Selecting it flips the chip to the stable label
+# "Pro". A separate model submenu (a role='menuitem' with aria-haspopup='menu'
+# labeled "GPT-5.6 Sol") sets the model, but the model is a persistent account
+# preference — a freshly loaded chatgpt.com (every worker's starting point)
+# defaults to Sol — and it is verified fail-closed post-send by the served-slug
+# audit. So the slow path corrects only the *effort* and never navigates the
+# fragile, hover-driven model submenu. The "Pro" radio carries no data-testid, so
+# we match on its exact accessible name; that also excludes the icon-only "Pro
+# effort options" config button (a role='menuitem', not menuitemradio, whose
+# accessible name is "Pro effort options", that appears when the Pro row is
+# focused).
+PRO_LABEL = "Pro"
 
 
-async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
-    """Make the composer chip read an Extended-reasoning label. Returns (ok, observed_text).
+async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
+    """Make the composer chip read the "Pro" effort tier. Returns (ok, observed_text).
 
-    Idempotent fast path: if the chip already reads `is_pro_extended_label`
-    we no-op without taking any lock — the typical case.
+    Idempotent fast path: if the chip already reads `is_pro_label` we no-op
+    without taking any lock — the typical case, since a fresh page defaults to
+    Sol+Pro.
 
-    Slow path (chip in a wrong state): held under `UiClipboardLock` plus a
+    Slow path (chip in a wrong effort): held under `UiClipboardLock` plus a
     `bring_tab_to_front` because the chip menu is a focus-sensitive Radix portal,
     and `keyboard.press("Escape")` on cleanup paths can close the wrong menu if a
-    concurrent worker brings its tab to front. The slow path opens the chip menu
-    and clicks the "Pro Extended" leaf (role='menuitemradio') directly — the
-    redesigned menu is flat, so there is no submenu to navigate.
+    concurrent worker brings its tab to front. It opens the chip menu and clicks
+    the "Pro" effort leaf (role='menuitemradio') directly. It does NOT touch the
+    model submenu — the model comes from the account default and is verified
+    fail-closed post-send by the served-slug audit; self-correcting it here would
+    add fragile submenu navigation for a rare drift the audit already catches.
     """
     chip = page.locator(COMPOSER_CHIP).first
     text = await read_composer_chip_text(page, timeout=30.0)
-    if is_pro_extended_label(text):
+    if is_pro_label(text):
         return True, text
 
     with UiClipboardLock():
@@ -529,12 +539,12 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
             log_stage("error", reason="chip_menu_open_failed", exception=f"{type(e).__name__}: {e}")
             return False, text
 
-        # The chip menu is the newest-mounted [role=menu]. "Pro Extended" is a
-        # direct menuitemradio leaf — anchor the regex so a future "Pro Extended+"
-        # or relabel doesn't silently match (an intentional product change worth
-        # reviewing rather than auto-accepting).
+        # The chip menu is the newest-mounted [role=menu]. The "Pro" effort tier
+        # is a direct menuitemradio leaf — anchor the regex so a future relabel
+        # doesn't silently match (an intentional product change worth reviewing
+        # rather than auto-accepting).
         menu = page.locator('[role="menu"]').last
-        item = menu.get_by_role("menuitemradio", name=re.compile(rf"^{re.escape(PRO_EXTENDED_LABEL)}$"))
+        item = menu.get_by_role("menuitemradio", name=re.compile(rf"^{re.escape(PRO_LABEL)}$"))
         try:
             await item.first.click(timeout=5000)
         except Exception as e:
@@ -544,14 +554,12 @@ async def ensure_extended_chip(page, *, run_dir: Path) -> tuple[bool, str | None
             await page.keyboard.press("Escape")
             return False, text
 
-        # Poll up to 5s for the chip text to update. We just clicked the
-        # "Pro Extended" leaf, so confirm with the full fail-closed predicate
-        # (both "Pro" and "Extended") — the post-click label is "Pro Extended".
+        # Poll up to 5s for the chip text to settle on the "Pro" effort label.
         deadline = time.time() + 5.0
         final_text = text
         while time.time() < deadline:
             final_text = (await chip.inner_text()).strip()
-            if is_pro_extended_label(final_text):
+            if is_pro_label(final_text):
                 return True, final_text
             await asyncio.sleep(0.2)
         return False, final_text
@@ -592,7 +600,7 @@ async def cmd_doctor() -> int:
             if ok:
                 try:
                     chip_text = await read_composer_chip_text(page, timeout=10.0)
-                    chip_status = "ok" if is_pro_extended_label(chip_text) else f"unexpected: {chip_text!r}"
+                    chip_status = "ok" if is_pro_label(chip_text) else f"unexpected: {chip_text!r}"
                 except Exception as e:
                     chip_status = f"failed: {type(e).__name__}: {e}"
             result = {
@@ -889,7 +897,7 @@ async def _copy_button_present(page) -> bool:
     """True if the latest assistant turn's post-completion Copy button is mounted.
 
     The turn-action toolbar (copy/regenerate/share) only renders after the turn
-    is finalized — Pro Extended's mid-run "thinking summary" panel does not have
+    is finalized — Pro's mid-run "thinking summary" panel does not have
     it. Used as the affirmative completion gate alongside text-stable + no Stop
     button: the text-only heuristic false-positives because Pro can sit on a
     summary string for tens of seconds while reasoning continues silently with
@@ -1151,7 +1159,7 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                     return err("needs_reauth")
                 log_stage("logged_in")
 
-                ok, chip_text = await ensure_extended_chip(page, run_dir=run_dir)
+                ok, chip_text = await ensure_pro_chip(page, run_dir=run_dir)
                 if not ok:
                     await safe_screenshot(page, run_dir / "error-model_select_failed.png")
                     (run_dir / "error.html").write_text(await page.content())
@@ -1193,25 +1201,27 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
 
                 await safe_screenshot(page, run_dir / "pre-send.png")
 
-                # Re-verify the model at the point of use — closes the
-                # time-of-check/time-of-use gap. ensure_extended_chip ran ~2.6s
-                # ago, right after page load; the chip can hydrate optimistically
-                # to "Extended Pro" and then re-resolve to the new conversation's
-                # default ("Thinking") during the paste/upload window, sending to
-                # the wrong model while model_verified logged "Extended Pro". This
-                # re-read is a passive inner_text() (no UiClipboardLock, no menu,
-                # no bring_to_front) so it can't hijack a sibling's paste. Fail
-                # closed: never send to a model we haven't verified. We do NOT
+                # Re-verify the effort at the point of use — closes the
+                # time-of-check/time-of-use gap. ensure_pro_chip ran ~2.6s ago,
+                # right after page load; the chip can hydrate optimistically to
+                # "Pro" and then re-resolve to the new conversation's default (a
+                # lower effort tier) during the paste/upload window, sending at
+                # the wrong effort while model_verified logged "Pro". This re-read
+                # is a passive inner_text() (no UiClipboardLock, no menu, no
+                # bring_to_front) so it can't hijack a sibling's paste. Fail
+                # closed: never send at an effort we haven't verified. We do NOT
                 # re-run the chip menu here — that needs the clipboard lock and a
                 # fragile Radix dance with a loaded composer; surface the run_dir
-                # instead. Nothing slow runs between this read and the click.
+                # instead. Nothing slow runs between this read and the click. The
+                # model axis (invisible in the chip) is backstopped only by the
+                # served-slug audit after completion.
                 #
                 # Uses the default stable read (not stable_polls=1): a chip
                 # actively oscillating at Send time must fail closed, not be
                 # accepted on a single lucky sample. The irreducible read→click
                 # window is backstopped by the served-slug audit after completion.
                 presend_chip = await read_composer_chip_text(page, timeout=10.0)
-                if not is_pro_extended_label(presend_chip):
+                if not is_pro_label(presend_chip):
                     await safe_screenshot(page, run_dir / "error-model_drift.png")
                     (run_dir / "error.html").write_text(await page.content())
                     log_stage("error", reason="model_drift_before_send",
@@ -1283,11 +1293,12 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 served_slug = await served_assistant_model_slug(page)
                 log_stage("served_model", slug=served_slug)
 
-                # A *present* slug naming a non-Pro model is authoritative
-                # contamination — fail closed regardless of `completed`, so a
-                # timed-out Thinking turn is never quietly reported as a plain
-                # timeout. response.md is kept as a diagnostic artifact; the
-                # result is an error so it is never printed as a success.
+                # A *present* slug naming a non-Pro model (anything but
+                # gpt-5-6-pro) is authoritative contamination — fail closed
+                # regardless of `completed`, so a timed-out non-Pro turn is never
+                # quietly reported as a plain timeout. response.md is kept as a
+                # diagnostic artifact; the result is an error so it is never
+                # printed as a success.
                 if served_slug and served_slug not in PRO_MODEL_SLUGS:
                     await safe_screenshot(page, run_dir / "error-served_model_mismatch.png")
                     log_stage("error", reason="served_model_mismatch", slug=served_slug)
@@ -1374,7 +1385,7 @@ def cmd_close_chrome(force: bool = False) -> int:
     """Tear down the shared gpt-pro Chrome process. Held under LaunchLock.
 
     Refuses by default when any worker holds a ParallelSlot — killing Chrome
-    out from under live tabs costs in-flight Pro Extended runs (5–20 min each).
+    out from under live tabs costs in-flight Pro runs (5–20 min each).
     Pass --force to bypass.
     """
     with LaunchLock():
@@ -1400,7 +1411,7 @@ def main() -> int:
     close_p.add_argument("--force", action="store_true",
                          help="Kill Chrome even if workers hold ParallelSlots. In-flight runs will lose their CDP connection.")
 
-    ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT Pro Extended. Prints response on stdout when ready.")
+    ask_p = sub.add_parser("ask", help="Send a prompt from stdin to ChatGPT GPT-5.6 Sol Pro. Prints response on stdout when ready.")
     ask_p.add_argument("--run-id", default=None,
                       help="Caller-supplied run id. Same id + same prompt attaches to an in-progress run.")
     ask_p.add_argument("--generation-timeout", type=float, default=DEFAULT_GENERATION_TIMEOUT,

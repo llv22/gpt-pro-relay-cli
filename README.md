@@ -22,7 +22,7 @@ remote ──ssh──▶ Mac ──[parent: ask]
                       [worker: _run] ──Playwright──▶ Chrome (persistent profile)
                        │                                          │
                        │ <── poll result.json ──┐                 ▼
-                       │                        │      chatgpt.com / Pro / Extended Pro
+                       │                        │      chatgpt.com / GPT-5.6 Sol / Pro
                        ▼                        │                 │
                   response on stdout            └─── result.json ◀┘
                   JSON status on stderr
@@ -43,7 +43,7 @@ uv sync
 uv run gpt-pro-relay login    # opens Chrome; sign in to ChatGPT manually
 ```
 
-Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **Pro** + **Extended Pro** once so the account preference is set.
+Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **GPT-5.6 Sol** + **Pro** once so the account preference is set.
 
 ### Optional: bare command on PATH
 
