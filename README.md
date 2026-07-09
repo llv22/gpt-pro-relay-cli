@@ -61,7 +61,7 @@ After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. 
 | Command | What it does |
 |---|---|
 | `gpt-pro-relay login` | Open Chrome at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
-| `gpt-pro-relay doctor` | Verify the profile is logged in. Probes the model picker. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
+| `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **GPT-5.6 Sol** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
 | `gpt-pro-relay ask [--run-id ID] [--no-wait] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits for completion, prints response on stdout. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
 | `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses by default if any worker holds a `ParallelSlot`; pass `--force` to kill anyway (in-flight runs lose their CDP connection). |

@@ -19,7 +19,7 @@ a lower tier, so the stability requirement still applies.
 import pytest
 
 from gpt_pro import cli
-from gpt_pro.cli import is_pro_label, read_composer_chip_text
+from gpt_pro.cli import classify_model_status, is_pro_label, read_composer_chip_text
 
 
 class _FakeChip:
@@ -131,3 +131,16 @@ async def test_steady_pro_passes_with_explicit_stable_polls():
     text = await read_composer_chip_text(page, timeout=1.0, stable_polls=3)
     assert text == "Pro"
     assert is_pro_label(text)
+
+
+def test_classify_model_status():
+    # doctor's read-only model check: the account default must be GPT-5.6 Sol.
+    assert classify_model_status("GPT-5.6 Sol") == "ok"
+    # A confirmed non-Sol model must be flagged so doctor goes red (the status
+    # is later matched with .startswith("unexpected")).
+    for wrong in ("GPT-5.5", "GPT-5.4", "o3", "GPT-5.3"):
+        assert classify_model_status(wrong).startswith("unexpected")
+    # An unreadable menu degrades to a non-fatal "unknown" (not "unexpected"),
+    # so a flaky Radix read never fails doctor on its own.
+    assert classify_model_status(None) == "unknown"
+    assert not classify_model_status(None).startswith("unexpected")

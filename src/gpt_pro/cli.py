@@ -565,6 +565,70 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
         return False, final_text
 
 
+# The selected MODEL is invisible in the chip — it's the checked radio inside the
+# chip menu's model submenu. `doctor` reads it to confirm the account default is
+# GPT-5.6 Sol; the worker send path does NOT (its authoritative model gate is the
+# served-slug audit). This closes the diagnostic gap the effort-only chip opened:
+# without it, `doctor` reports green on a wrong model whose default has drifted.
+SOL_MODEL_TOKEN = "Sol"  # distinctive substring: no other model row contains it
+
+
+def classify_model_status(model_text: str | None) -> str:
+    """Classify a read model label for `doctor`. `None` (unreadable menu) →
+    "unknown" (degraded, not fatal); a label containing "Sol" → "ok"; anything
+    else → "unexpected: <label>" (a confirmed wrong model, which fails doctor)."""
+    if model_text is None:
+        return "unknown"
+    if SOL_MODEL_TOKEN in model_text:
+        return "ok"
+    return f"unexpected: {model_text!r}"
+
+
+async def read_selected_model(page, *, timeout: float = 10.0) -> str | None:
+    """Return the currently-selected model's label from the chip menu, or None.
+
+    Read-only diagnostic (no selection, no send). Opens the Intelligence menu,
+    hovers the model submenu trigger — the `aria-haspopup='menu'` menuitem WITH
+    visible text, which excludes the icon-only "Pro effort options" config button
+    (empty text) — waits for the submenu, and reads its checked model radio. The
+    submenu-mounted guard (`count() >= 2`) is load-bearing: the *main* menu's
+    checked radio is the "Pro" EFFORT tier, so reading `.last` before the submenu
+    mounts would wrongly return the effort as the model. Returns None on any
+    failure so `doctor` degrades to "unknown" rather than erroring. Always closes
+    the menu with Escape.
+    """
+    chip = page.locator(COMPOSER_CHIP).first
+    try:
+        await chip.click()
+        await page.wait_for_selector('[role="menu"]', timeout=timeout * 1000)
+        trigger = page.locator(
+            '[role="menu"] [role="menuitem"][aria-haspopup="menu"]'
+        ).filter(has_text=re.compile(r"\S")).first
+        await trigger.hover()
+        await page.locator('[role="menu"]').nth(1).wait_for(state="visible", timeout=timeout * 1000)
+        deadline = time.time() + 3.0
+        model = None
+        while time.time() < deadline:
+            if await page.locator('[role="menu"]').count() >= 2:
+                submenu = page.locator('[role="menu"]').last
+                model = await submenu.evaluate(
+                    """m => { const r = m.querySelector('[role="menuitemradio"][aria-checked="true"]'); return r ? (r.innerText || '').trim() : null; }"""
+                )
+                if model:
+                    break
+            await asyncio.sleep(0.2)
+        return model or None
+    except Exception:
+        return None
+    finally:
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.1)
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+
 async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -597,17 +661,31 @@ async def cmd_doctor() -> int:
             (run_dir / "page.html").write_text(await page.content())
             chip_status = "skipped"
             chip_text = None
+            model_status = "skipped"
+            model_text = None
             if ok:
                 try:
                     chip_text = await read_composer_chip_text(page, timeout=10.0)
                     chip_status = "ok" if is_pro_label(chip_text) else f"unexpected: {chip_text!r}"
                 except Exception as e:
                     chip_status = f"failed: {type(e).__name__}: {e}"
+                # Read the selected model (read-only) so a default drifted off Sol
+                # is visible — the effort chip alone can't reveal it. A confirmed
+                # wrong model fails doctor; an unreadable menu degrades to
+                # "unknown" (not fatal), matching the served-slug fail-open.
+                try:
+                    model_text = await read_selected_model(page, timeout=10.0)
+                    model_status = classify_model_status(model_text)
+                except Exception as e:
+                    model_status = f"failed: {type(e).__name__}: {e}"
+            model_ok = not model_status.startswith("unexpected")
             result = {
-                "status": "ok" if ok else "needs_reauth",
+                "status": "ok" if (ok and model_ok) else ("needs_reauth" if not ok else "model_mismatch"),
                 "url": page.url,
                 "chip": chip_status,
                 "chip_text": chip_text,
+                "model": model_status,
+                "model_text": model_text,
                 "run_dir": str(run_dir),
             }
         finally:
@@ -616,7 +694,7 @@ async def cmd_doctor() -> int:
             except Exception:
                 pass
     print(json.dumps(result, indent=2))
-    return 0 if ok else 1
+    return 0 if (ok and model_ok) else 1
 
 
 # ---- login ----
