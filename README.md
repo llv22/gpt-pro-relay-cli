@@ -175,4 +175,6 @@ Up to `GPT_PRO_MAX_PARALLEL` (default 6) runs share one Chrome, each in its own 
 
 ## Credits
 
-Original project and design by **Chris Liu** — **[github.com/chrisliu298/gpt-pro-relay](https://github.com/chrisliu298/gpt-pro-relay)**. This fork ([github.com/llv22/gpt-pro-relay](https://github.com/llv22/gpt-pro-relay)) adds the headless-Linux port, composer tools, and configurable model/paths.
+Original project and design by **Chris Liu** ([@chrisliu298](https://github.com/chrisliu298)) — **[github.com/chrisliu298/gpt-pro-relay](https://github.com/chrisliu298/gpt-pro-relay)**. The submit-and-wait architecture, the file-lock concurrency model, and the fail-closed model/effort audit are all his; his commit history is preserved here.
+
+This repo ([github.com/llv22/gpt-pro-relay-cli](https://github.com/llv22/gpt-pro-relay-cli)) continues that work with a headless-Linux port, ChatGPT composer tools, and configurable model/paths.

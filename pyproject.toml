@@ -2,6 +2,11 @@
 name = "gpt-pro"
 version = "0.1.0"
 description = "Drive a logged-in ChatGPT Pro browser session over SSH."
+# Original author of the project and its design; this is a fork.
+authors = [
+    {name = "Chris Liu", email = "chrisliu298@gmail.com"},
+    {name = "Orlando Ding", email = "xiandao.airs@gmail.com"},
+]
 requires-python = ">=3.11"
 dependencies = [
     "playwright>=1.46",
