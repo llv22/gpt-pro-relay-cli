@@ -101,11 +101,11 @@ When `_run` starts failing with `model_select_failed`, the screenshots + `error.
 
 - Python 3.11+, `uv` for env management. `uv venv` + `uv sync`. Never `pip` directly.
 - Stdout = response. Stderr = newline-delimited JSON. Don't mix them — the SSH UX depends on this split.
-- **Run artifacts default to `./runs/<run_id>/` in the current working directory** (`RUNS`), not `~/.gpt-pro` — so a checkout keeps its own runs beside its `query/` archive. `GPT_PRO_RUNS_DIR` overrides; `GPT_PRO_HOME` moves runs+locks together. The coordination **locks** stay under `~/.gpt-pro` (`STATE`). `runs/` is gitignored.
+- **Run artifacts default to `./runs/<run_id>/` in the current working directory** (`RUNS`), not `~/.gpt-pro` — so a checkout keeps its own runs beside its `research/` archive. `GPT_PRO_RUNS_DIR` overrides; `GPT_PRO_HOME` moves runs+locks together. The coordination **locks** stay under `~/.gpt-pro` (`STATE`). `runs/` is gitignored.
 - Profile dir is `~/.gpt-pro-profile/` — outside the repo, never committed.
 - Worker spawned via `[sys.executable, "-m", "gpt_pro.cli", "_run", run_id]` so it works regardless of how the parent was invoked.
 - **Docs live in `docs/`** (`docs/SETUP.md` = full macOS + headless-Linux setup + how to run normal vs deep-research queries). `README.md` stays a summary and links into `docs/`.
-- **Query archive convention** (`query/README.md`): a relayed query → `query/Q<N>-<slug>.md` (the prompt, **tracked**); each answer → `query/R<N>-<slug>-<option>.md` (`<option>` = `pro` | `deep-research` | `web-search` | …; **git-ignored** via `query/R[0-9]*.md`). Same `N`+slug pairs a query with its result(s). When relaying a query for the user, file it this way with the next free `N`.
+- **Research archive is a PRIVATE sub-repo** (topics never touch this public repo). It lives in a git-ignored `research/` folder (a separate private repo, `llv22/gpt-pro-relay-research`, cloned in — NOT a submodule). Layout is one folder per query: `research/Q<N>-<slug>/query.md` (the prompt) + `research/Q<N>-<slug>/result-<option>.md` (`<option>` = `pro` | `deep-research` | `web-search` | …). When relaying a query for the user, file it there with the next free `N`, and never commit query/result content to the public repo. See `research/README.md` (private) and the README's "Research archive" section (public, structure only).
 
 ## ToS reality
 

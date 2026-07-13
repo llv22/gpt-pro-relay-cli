@@ -7,10 +7,10 @@ __pycache__/
 dist/
 build/
 .gpt-pro-cookies*.json
-# query archive (see query/README.md): queries Q<N>-<slug>.md are TRACKED;
-# results R<N>-<slug>-<option>.md are model output — not committed.
-query/R[0-9]*.md
-# relocated run artifacts / state (GPT_PRO_RUNS_DIR / GPT_PRO_HOME) — never commit
-# these: they hold prompts, responses, chat URLs, and screenshots.
+# Private research archive — a separate private repo cloned into research/.
+# Never committed to this public repo (topics stay internal). See README.
+research/
+# Run artifacts / state (GPT_PRO_RUNS_DIR / GPT_PRO_HOME) — never commit these:
+# they hold prompts, responses, chat URLs, and screenshots.
 runs/
 .gpt-pro-state/

@@ -150,14 +150,22 @@ If a session drops mid-run, **never re-run `ask` fresh** — recover with `fetch
 | 4 | run_dir not found (fetch) |
 | 124 | wait timed out, run still pending |
 
-## Query archive
+## Research archive (private sub-repo)
 
-Relayed queries and their answers are archived under [`query/`](query/README.md) with a fixed rule:
+Queries relayed through this CLI and their results are **not** stored in this repo — research topics stay internal. They live in a **separate private repo** cloned into a git-ignored `research/` folder. It is deliberately **not** a git submodule, so the public repo holds no reference to it (a `.gitmodules` entry would leak the private repo's URL).
 
-- **Query** → `query/Q<N>-<slug>.md` — the exact prompt (tracked in git).
-- **Result** → `query/R<N>-<slug>-<option>.md` — one per option used (`pro`, `deep-research`, …); git-ignored.
+Structure — one folder per query, grouping a prompt with all of its answers:
 
-Same `N` + slug pairs a query with its result(s). See `query/README.md`.
+```
+research/                          # private repo, git-ignored in this checkout
+├── README.md                      # archive index + convention
+└── Q<N>-<slug>/                    # N sequential, kebab-case slug
+    ├── query.md                   # the exact prompt sent
+    ├── result-pro.md              # plain Pro answer (no tool)
+    └── result-<option>.md         # one file per composer option used (deep-research, web-search, …)
+```
+
+`runs/` (raw per-run artifacts — screenshots, `result.json`, worker logs) is likewise git-ignored and local. To set this up, create a private repo and clone it into `research/`; its own README carries the index and "how to add a query".
 
 ## Artifacts
 
