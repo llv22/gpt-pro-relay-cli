@@ -86,9 +86,25 @@ SPIKE_CHROME_ARGS = [
 
 SPIKE_RUNS = Path.home() / ".gpt-pro" / "spike"
 
+# Chrome's OLD headless advertises "HeadlessChrome" in the UA, which Cloudflare's
+# managed challenge ("Just a moment...") flags on sight — it walls the app before
+# ChatGPT ever loads. NEW headless (--headless=new) presents like real Chrome and
+# clears it; we also pin a plain Linux-Chrome UA so no headless token leaks.
+# (Verified 2026-07-12: old headless -> CF challenge; new headless + this UA ->
+# app served with composer + effort chip present.)
+SPIKE_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+)
 
-def _channel() -> str:
+
+def _channel() -> str | None:
     # Real Chrome per the invariant. Override only for local experiments.
+    # When GPT_PRO_SPIKE_EXECUTABLE points at a specific Chrome binary
+    # (e.g. a rootless Chrome-for-Testing extraction), channel must be None —
+    # channel and executable_path are mutually exclusive in Playwright.
+    if os.environ.get("GPT_PRO_SPIKE_EXECUTABLE"):
+        return None
     return os.environ.get("GPT_PRO_SPIKE_CHANNEL", "chrome")
 
 
@@ -132,13 +148,24 @@ class HeadlessSession:
     async def __aenter__(self):
         self._pw = await async_playwright().start()
         w, h = self.viewport
-        self.ctx = await self._pw.chromium.launch_persistent_context(
+        args = [*SPIKE_CHROME_ARGS, *_extra_args()]
+        # For headless, use NEW headless (--headless=new) launched via headless=False
+        # so Playwright doesn't inject the OLD --headless flag. New headless needs no
+        # X server and clears the Cloudflare challenge that old headless trips.
+        if self.headless:
+            args.append("--headless=new")
+        launch_kwargs = dict(
             user_data_dir=str(PROFILE),
-            headless=self.headless,
+            headless=False,
             channel=_channel(),
-            args=[*SPIKE_CHROME_ARGS, *_extra_args()],
+            args=args,
+            user_agent=SPIKE_UA,
             viewport={"width": w, "height": h},
         )
+        executable = os.environ.get("GPT_PRO_SPIKE_EXECUTABLE")
+        if executable:
+            launch_kwargs["executable_path"] = executable
+        self.ctx = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
         # Chrome's IN-PROCESS clipboard (no OS pasteboard in headless) — this is
         # what makes navigator.clipboard.{writeText,readText} usable as the
         # pbcopy/pbpaste replacement.
