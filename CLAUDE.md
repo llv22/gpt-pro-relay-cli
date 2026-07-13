@@ -14,6 +14,41 @@ The shape was chosen after a multi-perspective design review converged on the sm
 - **Fail closed on model + reasoning.** Since the 2026-07 GPT-5.6 redesign the composer chip shows the reasoning-**effort** tier ONLY — the model is a separate axis with no chip signal (no aria-label, no dataset key, no hidden mirror text). So the two axes are gated separately: the pre-send chip verifies the *effort* and the post-send served-slug audit verifies the *model*. The fast path requires the chip to contain `"Pro"` — the top effort tier and the only one carrying that token (`is_pro_label`); model names never appear in the chip, so a substring test uniquely identifies the Pro tier. Use predicate matching (substring tests, not exact-string equality): ChatGPT relabels this chip across redesigns (bare `"Pro"` is current; `"Pro Extended"` / `"Extended Pro"` / `"Extended"` were earlier GPT-5.5-era labels). The desired model is **GPT-5.6 Sol**, whose served slug is `gpt-5-6-pro` (the UI display name "Sol" and the slug diverge — verified 2026-07-09 via a live send). Never *return* an answer from a model we haven't verified: a served slug outside `PRO_MODEL_SLUGS` is fatal.
 - **The effort chip is verified at three points, not one — it's a time-of-check/time-of-use problem.** Reading the chip once after page load is insufficient: the pill hydrates optimistically to the persisted "Pro" and then an async resolution can re-resolve a new conversation's default to a lower effort tier within ~2.6s. (The GPT-5.5-era incident: run `ask-20260531T065451Z` logged `model_verified="Extended Pro"` yet was served `gpt-5-5-thinking`, ≈12% of runs — the mechanism survives the redesign, only the labels changed.) The three layers, all fail-closed: (1) **`read_composer_chip_text` requires a stable read** — the same non-placeholder label for `stable_polls` (default 3) consecutive ~0.2s polls; on timeout it returns `""` (never the last transient), so an oscillating chip fails the predicate. (2) **Pre-send re-verify** — immediately before the Send click, re-read the chip (a passive `inner_text()`, *no* `UiClipboardLock`, *no* menu) and `model_drift_before_send` if it isn't `is_pro_label`. Do NOT re-run the chip menu here (needs the lock, fragile Radix nav on a loaded composer) — fail closed and surface the run_dir. (3) **Served-slug audit** — after completion, read the served turn's `data-message-model-slug`; a present slug not in `PRO_MODEL_SLUGS` (an explicit allowlist = `{"gpt-5-6-pro"}`, *not* a `startswith` test) is fatal *regardless of* `completed`. A *missing* slug degrades fail-OPEN (returns `ok` with `model_audit: "unverified_missing_slug"` + a `served_model_unverified` stage) — making it fatal would brick the tool on a single attribute rename, the same blast radius the network-body-gate was rejected for. **The served-slug audit is now the *only* pre-return model check** — the chip carries no model signal, so `model_verified`/`model_reverified` confirm the *effort* only. But the slug encodes the *effort tier too*, not just the model (Sol+Pro → `gpt-5-6-pro`; Sol+High → `gpt-5-6-thinking`, measured 2026-07-09), so on a **present** slug the audit catches an effort downgrade *and* a model swap — closing the effort read→Send TOCTOU fail-closed (a dropped effort stamps a non-allowlisted slug → `served_model_mismatch`). Residual risks: a present-slug drift is caught only *after* a full Pro send is spent (then rejected → resubmit). When the slug is **absent** (an OpenAI attribute rename — on a *completed* turn the slug is stamped, so "missing" ≈ a rename, not a per-run flake), the chip proves neither model nor effort, so the audit falls back to an **independent read-only chip-menu model read** (`read_selected_model` → `classify_served_audit`): a *confirmed* non-Sol model is fatal (`model_menu_mismatch`), Sol confirms the model but leaves effort unverified (`model_ok_slug_missing`, fail-open), and only an unreadable menu keeps the bare `unverified_missing_slug` fail-open. So the one path that can still *return* a wrong-model answer as `ok` now requires **two** simultaneous selector breaks — the slug attribute AND the menu — plus a default drifted off Sol; making either fatal alone would brick on a single rename (the blast radius the network-body-gate was rejected for). **`doctor` is the standing drift detector**: it runs the same read-only model read (no send) and exits non-zero on a confirmed non-Sol default — run it after any manual profile poking. NB the composer *effort* default is a persistent profile preference (a stray non-Pro selection sticks across fresh pages until reset; the send-path slow path re-selects Pro each run, but `doctor` flags it). Regression tests in `tests/test_chip_read.py` (`is_pro_label` + `classify_model_status` + `doctor_exit_ok` + `classify_served_audit`).
 
+## Running headless on Linux (GPT_PRO_HEADLESS fork)
+
+The CLI is macOS-native but runs on a GUI-less Linux box via a single `IS_MAC`
+gate that forks **exactly three seams** — everything else (shared-Chrome-over-CDP,
+the three locks, worker/supervisor split, completion gate, chip logic, slug audit)
+is byte-identical and platform-agnostic. Do NOT add a second code path for these;
+do NOT try to make Linux use `open -a` or the pasteboard.
+
+- **Launch** — `_chrome_launch_command()` is the one fork point. macOS keeps
+  `open -n -a` (LaunchServices identity + compositor surface, both irrelevant
+  headless). Linux direct-execs `_chrome_binary()` (`GPT_PRO_CHROME_BINARY`, else
+  system Chrome / a rootless Chrome-for-Testing extraction) in **new headless**
+  (`--headless=new`) with a spoofed Linux-Chrome UA. **The UA is load-bearing:**
+  old headless advertises `HeadlessChrome`, which Cloudflare's "Just a moment…"
+  managed challenge walls before ChatGPT loads (the login check false-passes
+  because it reads the cookie jar, not the served page). Also `--disable-dev-shm-usage`
+  and `--no-sandbox` (this distro disables unprivileged user namespaces via
+  AppArmor, so the zygote sandbox FATALs; Playwright passes `--no-sandbox` by
+  default for the same reason, and real Pro sends work with it — the anti-detection
+  note above is macOS-calibrated). Toggle off with `GPT_PRO_NO_SANDBOX=0`.
+- **Paste** — `_focus_and_paste` uses Chrome's in-browser clipboard
+  (`navigator.clipboard.writeText` + `Ctrl+V`) instead of `pbcopy`+`Cmd+V`. Still
+  under `UiClipboardLock` (one clipboard per Chrome, shared across tabs); no OS
+  pasteboard to save/restore. `connect_shared_chrome` grants clipboard-read/write.
+- **Extract** — `_copy_button_extract` uses Copy + `navigator.clipboard.readText()`
+  instead of `pbpaste`.
+
+**No interactive `login` headless** — seed the profile by cookie injection
+instead (`spike/seed_profile.py` reads a Cookie-Editor JSON export; the login is
+just the `__Secure-next-auth.session-token` cookie). **Model:** the served-slug
+allowlist is env-configurable via `GPT_PRO_MODEL_SLUGS` (comma-separated, unioned
+with the Sol-only default) — an account without GPT-5.6 Sol can opt in its Pro
+slug (e.g. `gpt-5-5-pro`) without weakening the shipped fail-closed default. The
+slug still encodes the effort tier (`…-pro`), so the Pro-effort gate stays intact.
+
 ## ask / fetch / _run — the submit-and-wait architecture
 
 `ask` does NOT drive the browser directly. It's a supervisor:
