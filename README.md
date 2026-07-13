@@ -1,103 +1,130 @@
 # gpt-pro-relay
 
-Relay prompts to your logged-in ChatGPT Pro session from anywhere with SSH. Your always-on Mac drives a real Chrome via Playwright; remote agents and other machines invoke it as a CLI:
+Relay prompts to your logged-in **ChatGPT Pro** session from anywhere with SSH. A host machine drives a real Chrome via Playwright; remote agents and other machines invoke it as a CLI:
 
 ```bash
 RUN_ID=$(uuidgen)
-echo "your prompt" | ssh mac gpt-pro-relay ask --run-id "$RUN_ID"
+echo "your prompt" | ssh host gpt-pro-relay ask --run-id "$RUN_ID"
 ```
 
-`uv sync` installs `gpt-pro-relay` into the project's venv.
+> **Fork.** This is a fork of Chris Liu's original **[chrisliu298/gpt-pro-relay](https://github.com/chrisliu298/gpt-pro-relay)** — full credit for the design (the submit-and-wait architecture, the file-lock concurrency model, the fail-closed model/effort audit) goes to the original. This fork adds a **headless-Linux port**, **ChatGPT composer tools** (`--tool`: web search, deep research, …), and configurable model/paths. See [Credits](#credits).
 
 > Browser automation against ChatGPT violates OpenAI's ToS. Account-ban risk is yours. Don't build a product on it.
 
 ## How it works
 
 ```
-remote ──ssh──▶ Mac ──[parent: ask]
-                       │
-                       │ writes prompt.md, meta.json
-                       │ spawns detached worker (start_new_session)
-                       ▼
-                      [worker: _run] ──Playwright──▶ Chrome (persistent profile)
-                       │                                          │
-                       │ <── poll result.json ──┐                 ▼
-                       │                        │      chatgpt.com / GPT-5.6 Sol / Pro
-                       ▼                        │                 │
-                  response on stdout            └─── result.json ◀┘
-                  JSON status on stderr
+remote ──ssh──▶ host ──[parent: ask]
+                        │
+                        │ writes prompt.md, meta.json
+                        │ spawns detached worker (start_new_session)
+                        ▼
+                       [worker: _run] ──Playwright──▶ Chrome (persistent profile)
+                        │                                          │
+                        │ <── poll result.json ──┐                 ▼
+                        │                        │      chatgpt.com / Pro model / Pro effort
+                        ▼                        │                 │
+                   response on stdout            └─── result.json ◀┘
+                   JSON status on stderr
 ```
 
 No daemon. No HTTP server. No queue. SSH is the transport. The worker is detached from the SSH session, so a mid-run drop doesn't kill it — `gpt-pro-relay fetch <run_id>` recovers the response.
 
+## Platforms
+
+| | macOS (original) | Headless Linux (this fork) |
+|---|---|---|
+| Chrome launch | `open -n -a "Google Chrome"` (LaunchServices) | direct-exec the Chrome binary, **new headless** + spoofed UA |
+| Clipboard I/O | `pbcopy` / `pbpaste` / `Cmd+V` | Chrome's in-browser clipboard (`writeText` + `Ctrl+V`, `readText`) |
+| Display | needs a logged-in GUI session | none — runs fully headless |
+| Login | interactive (`login`) | cookie injection (see below) |
+
+A single `IS_MAC` gate forks exactly those three seams; the shared-Chrome-over-CDP architecture, the three file locks, the worker/supervisor split, the completion gate, and the model audit are identical on both.
+
 ## Setup
 
-Requires:
-
-- A Mac that stays logged into its GUI session. Playwright drives real Chrome and needs WindowServer access, so a headless box won't work — leave the Mac signed in (and use `caffeinate` if it sleeps).
-- Python 3.11+, [uv](https://docs.astral.sh/uv/), and Google Chrome (real Chrome, not bundled Chromium — auth and anti-abuse behave differently).
-- A ChatGPT Pro account.
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and a ChatGPT Pro (or Enterprise) account.
 
 ```bash
-uv sync
-uv run gpt-pro-relay login    # opens Chrome; sign in to ChatGPT manually
+uv sync   # installs gpt-pro-relay into the project's venv
 ```
 
-Login uses a dedicated profile at `~/.gpt-pro-profile/`. Cookies persist there. Manually select **GPT-5.6 Sol** + **Pro** once so the account preference is set.
+- **macOS** — `uv run gpt-pro-relay login`, then sign in and pick your Pro model + **Pro** effort once.
+- **Headless Linux** — supply a Chrome binary (`GPT_PRO_CHROME_BINARY`) and seed the login by cookie injection (`spike/seed_profile.py`); no display needed.
 
-### Optional: bare command on PATH
+Full instructions for both platforms — Chrome for Testing, cookie seeding, model/effort selection, and running normal vs. deep-research queries — are in **[docs/SETUP.md](docs/SETUP.md)**.
 
-For SSH callers to use `gpt-pro-relay` without the full venv path, symlink it into a directory that's on your non-interactive shell `PATH`. On zsh, `~/.local/bin/` works if you export it in `~/.zshenv` (which zsh sources for SSH sessions, unlike `~/.zshrc`):
-
-```bash
-mkdir -p ~/.local/bin
-ln -sf "$PWD/.venv/bin/gpt-pro-relay" ~/.local/bin/gpt-pro-relay
-```
-
-After that, `ssh mac gpt-pro-relay ask ...` resolves without the absolute path. Skip if you'd rather hardcode the full venv path in your callers.
+Optional: put the command on `PATH` — `ln -sf "$PWD/.venv/bin/gpt-pro-relay" ~/.local/bin/gpt-pro-relay`.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `gpt-pro-relay login` | Open Chrome at chatgpt.com using the dedicated profile. Auto-detects login (session cookie) and exits. |
-| `gpt-pro-relay doctor` | Verify the profile is logged in and that the composer is set to **GPT-5.6 Sol** + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML to `~/.gpt-pro/runs/`. Prints JSON status. |
-| `gpt-pro-relay ask [--run-id ID] [--no-wait] [--output PATH]` | Read prompt from stdin. Spawns a detached worker. Default: waits for completion, prints response on stdout. `--no-wait`: exits 0 right after submission (use `fetch` to retrieve). Same `--run-id` + same prompt re-attaches to an in-progress run (idempotent). `--output` writes to a file instead of stdout. |
-| `gpt-pro-relay fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` for non-blocking check, `--timeout 60` to bound a single poll. `--output` writes to a file instead of stdout. |
-| `gpt-pro-relay close-chrome [--force]` | Tear down the shared gpt-pro Chrome process. Refuses by default if any worker holds a `ParallelSlot`; pass `--force` to kill anyway (in-flight runs lose their CDP connection). |
+| `login` | Open Chrome at chatgpt.com using the dedicated profile; auto-detects login (session cookie) and exits. (macOS / interactive.) |
+| `doctor` | Verify the profile is logged in and the composer is set to the expected model + **Pro** effort (read-only; no prompt sent). Exits non-zero on a confirmed wrong model. Saves screenshot + HTML. |
+| `ask [--run-id ID] [--tool TOOL]… [--no-wait] [--output PATH]` | Read prompt from stdin, spawn a detached worker. Default: wait for completion, print response on stdout. `--no-wait`: exit 0 right after submission (use `fetch`). Same `--run-id` + same prompt re-attaches (idempotent). |
+| `fetch <run-id> [--output PATH]` | Read the result of an existing run. Waits if still running. `--timeout 0` = non-blocking; `--timeout 60` bounds a single poll. |
+| `close-chrome [--force]` | Tear down the shared Chrome. Refuses by default if any worker holds a slot; `--force` kills anyway. |
+
+## Composer tools (`--tool`)
+
+`ask --tool <name>` enables a ChatGPT composer tool before sending (repeatable). Names mirror the ChatGPT UI; an unsupported name fails immediately (argparse error):
+
+| `--tool` | ChatGPT option |
+|---|---|
+| `web-search` | Web search (real-time info + citations) |
+| `create-image` | Create image |
+| `company-knowledge` | Company knowledge (workspace connectors) |
+| `deep-research` | Deep research (multi-minute cited report) |
+| `google-drive` | Google Drive |
+
+```bash
+echo "latest stable Python version?" | gpt-pro-relay ask --tool web-search
+echo "survey trajectory-level credit assignment in agent RL" | gpt-pro-relay ask --tool deep-research
+```
+
+Tool availability depends on your account (connectors like `company-knowledge` / `google-drive` need workspace provisioning; a missing tool fails with `tool_unavailable`). When a tool is active, the served-slug model audit is fail-open (`tool_mode_unaudited`) — tools legitimately run their own model.
+
+**Deep research** renders its report inside an OpenAI cross-origin **sandboxed iframe** with no DOM/clipboard access, so extraction goes through the report's *Export → Markdown* download (coordinate-driven, inherently more fragile than other tools). Completion is detected by the export succeeding.
+
+## Configuration (environment)
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `GPT_PRO_CHROME_BINARY` | probe common paths | Chrome binary for the headless Linux launch |
+| `GPT_PRO_NO_SANDBOX` | `1` (Linux) | `0` disables `--no-sandbox` where the OS sandbox works |
+| `GPT_PRO_MODEL_SLUGS` | `gpt-5-6-pro` | Comma-separated allowlist of served model slugs, **unioned** with the Sol default. An account without GPT-5.6 Sol can opt in its Pro slug (e.g. `gpt-5-5-pro`) without weakening the shipped fail-closed default. |
+| `GPT_PRO_RUNS_DIR` | `./runs` | Where run artifacts go — **defaults to the current folder**, not `~/.gpt-pro`. |
+| `GPT_PRO_HOME` | `~/.gpt-pro` | Coordination-lock dir (and runs, if `GPT_PRO_RUNS_DIR` unset). Keep consistent across concurrent workers. |
+| `GPT_PRO_MAX_PARALLEL` | `6` | Max concurrent runs sharing one Chrome (ceiling 10). Drop to `1` if the account flags parallel bursts. |
+| `GPT_PRO_COOKIE_FILE` | `~/.gpt-pro-cookies.json` | Cookie export read by `spike/seed_profile.py`. |
 
 ## Usage
 
-The CLI is the same whether you're calling it locally or relaying over SSH. Pick whichever matches your setup.
+The CLI is identical locally or over SSH.
 
 ### Local
-
-Same machine running ChatGPT and the caller — no transport, no wrapper:
 
 ```bash
 RUN_ID=$(uuidgen)
 echo "your prompt" | gpt-pro-relay ask --run-id "$RUN_ID"
 ```
 
-If `gpt-pro-relay` isn't on `PATH`, prefix with `uv run --project /path/to/repo` or call the venv binary directly. Up to `GPT_PRO_MAX_PARALLEL` (default 6) concurrent runs share one Chrome process; beyond that they queue on a file-lock semaphore in `~/.gpt-pro/slots/`.
+### Remote (SSH) — short-session polling
 
-### Remote (SSH)
-
-**Recommended: short-session polling.** Holding one SSH connection idle for the full 5–20 min reasoning window is brittle — NAT/firewall idle-drops mid-run are routine. Submit with `--no-wait`, then poll `fetch` with bounded timeouts:
+Holding one SSH connection idle for the full 5–20 min reasoning window is brittle. Submit with `--no-wait`, then poll `fetch` with bounded timeouts:
 
 ```bash
 SSH_OPTS=(-S none -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 RUN_ID="ask-$(date -u +%Y%m%dT%H%M%SZ)-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 
-# Phase 1: submit (≤1s SSH session, idempotent on same run_id + same prompt)
-ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<'PROMPT'
+ssh "${SSH_OPTS[@]}" host gpt-pro-relay ask --run-id "$RUN_ID" --no-wait <<'PROMPT'
 your prompt here
 PROMPT
 
-# Phase 2: poll (each SSH session ≤60s, exponential backoff on transport drop)
 deadline=$((SECONDS + 3600)); delay=5
 while (( SECONDS < deadline )); do
-  out=$(ssh "${SSH_OPTS[@]}" mac gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
+  out=$(ssh "${SSH_OPTS[@]}" host gpt-pro-relay fetch "$RUN_ID" --timeout 60 2>/tmp/gpt-pro-$RUN_ID.err); rc=$?
   case $rc in
     0)   printf '%s' "$out"; exit 0 ;;
     124) delay=5; continue ;;
@@ -105,58 +132,47 @@ while (( SECONDS < deadline )); do
     *)   cat /tmp/gpt-pro-$RUN_ID.err >&2; exit "$rc" ;;
   esac
 done
-echo "gpt-pro-relay overall timeout for $RUN_ID" >&2; exit 124
+echo "overall timeout for $RUN_ID" >&2; exit 124
 ```
 
-The SSH options matter: `-S none` avoids ControlMaster reuse (which can resurrect stale paths), `BatchMode=yes` prevents password-prompt hangs, `ConnectTimeout=15` + `ServerAliveInterval=15`/`CountMax=4` cap a dead session at ~60s instead of 5 min. The Phase 1 submit is idempotent — same `--run-id` + same prompt bytes attaches to an existing run, so a transport-flake retry is safe.
+If a session drops mid-run, **never re-run `ask` fresh** — recover with `fetch "$RUN_ID"` (the same `--run-id` + same prompt bytes re-attaches idempotently).
 
-**Blocking single-call (stable links only):**
+### Stdio contract
 
-```bash
-ssh "${SSH_OPTS[@]}" mac gpt-pro-relay ask --run-id "$RUN_ID" <<<prompt
-```
+`stdout` = the response. `stderr` = newline-delimited JSON (`submitted`, then a terminal `ok`/`error`/`timeout`). `--output PATH` writes the response to a file instead; stdout stays empty and the terminal line gains `"output": "<path>"`.
 
-If the SSH session drops mid-run, **never re-run `ask`** — that would submit a fresh prompt and burn another 5–20 min of Pro reasoning. Recover with `gpt-pro-relay fetch "$RUN_ID"` (or just enter the polling loop above).
-
-### Stdio contract (both modes)
-
-`stdout` is the response. `stderr` is newline-delimited JSON: a `submitted` line when the run starts, then a terminal `ok`/`error`/`timeout` line.
-
-Pass `--output PATH` to write the response to a file on the gpt-pro host instead. stdout stays empty; the terminal stderr line gains an `"output": "<resolved-path>"` field. Useful when the caller would rather `Read` a file than capture potentially-large stdout.
-
-Exit codes:
-
-| code | meaning |
+| exit | meaning |
 |---|---|
-| 0 | `status: ok`, response on stdout (or `ask --no-wait` submitted; nothing on stdout) |
-| 1 | `status: error`, see `reason` field |
-| 2 | usage error (empty prompt, prompt_too_large, run_id_conflict, invalid run_id) |
-| 3 | `status: timeout` (browser worker didn't finish within 60 min) |
-| 4 | run_dir not found (fetch only) |
+| 0 | `ok` (or `--no-wait` submitted) |
+| 1 | `error`, see `reason` |
+| 2 | usage error (empty/oversized prompt, run_id conflict, bad tool) |
+| 3 | `timeout` (worker didn't finish within the generation timeout) |
+| 4 | run_dir not found (fetch) |
 | 124 | wait timed out, run still pending |
+
+## Query archive
+
+Relayed queries and their answers are archived under [`query/`](query/README.md) with a fixed rule:
+
+- **Query** → `query/Q<N>-<slug>.md` — the exact prompt (tracked in git).
+- **Result** → `query/R<N>-<slug>-<option>.md` — one per option used (`pro`, `deep-research`, …); git-ignored.
+
+Same `N` + slug pairs a query with its result(s). See `query/README.md`.
 
 ## Artifacts
 
-Each run writes to `~/.gpt-pro/runs/<run_id>/` by default. Set **`GPT_PRO_RUNS_DIR`** to relocate just the run artifacts (e.g. into a project folder), or **`GPT_PRO_HOME`** to relocate the whole state dir (runs + coordination locks). Both the `ask` parent and the detached worker read these from the environment, so export them before invoking. Keep `GPT_PRO_HOME` consistent across concurrent runs — the locks live under it (relocating only `GPT_PRO_RUNS_DIR` always keeps the locks shared). Run artifacts hold prompts, responses, and chat URLs; don't commit them.
+Each run writes to `<RUNS>/<run_id>/` (default `./runs/<run_id>/`):
 
-- `prompt.md` — input
-- `meta.json` — `{run_id, created_at, prompt_sha256}`
-- `response.md` — extracted assistant message (atomic). `result.json` reports `extraction: "copy_button"` or `"innertext"`.
+- `prompt.md`, `meta.json` (`{run_id, created_at, prompt_sha256, tools}`)
+- `response.md` — extracted assistant message; `result.json` reports `extraction: "copy_button" | "innertext" | "deep_research_export_md"`
 - `result.json` — terminal status (atomic)
-- `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`
-- `final.html` — last DOM snapshot
-- `network.json` — captured `/backend-api/*` calls
-- `worker.stdout`, `worker.stderr` — detached worker's output
+- `pre-send.png`, `streaming-NNN.png`, `final.png`, `error-*.png`, `final.html`, `network.json`
+- `worker.stdout`, `worker.stderr`
 
 ## Concurrency
 
-Up to `GPT_PRO_MAX_PARALLEL` (default 6) `ask` invocations run in parallel — each gets its own tab in a shared Chrome process. Beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Set `GPT_PRO_MAX_PARALLEL=10` for the personal-use ceiling; lower it to `1` if ChatGPT account-side anti-abuse starts flagging parallel bursts (symptom: unexplained `needs_reauth`, captcha redirects, or 429s in `network.json`). Chrome stays alive between runs; `gpt-pro-relay close-chrome` tears it down when no workers are in flight.
+Up to `GPT_PRO_MAX_PARALLEL` (default 6) runs share one Chrome, each in its own tab; beyond that they queue on a file-lock semaphore (`~/.gpt-pro/slots/`). Chrome stays alive between runs; `gpt-pro-relay close-chrome` tears it down when no workers are in flight.
 
-## Known limitations
-- Markdown extraction uses the page's Copy button (clean LaTeX, code fences, tables); falls back to `innerText` if the Copy button isn't reachable or `pbpaste` isn't available (non-macOS).
-- Completion detection is heuristic (text-stable + no Stop button), not the `/backend-api/conversation/<id>/async-status` endpoint. The async-status endpoint only fires once at the end and our heuristic catches the same moment — not worth wiring.
-- If the SSH-side parent dies before reading stdin and spawning the worker, no run is created — `fetch` returns `not_found`. That's by design.
+## Credits
 
-## Claude Code skill
-
-No skill ships with this repo. For the SSH-relay flow (Claude Code on a different machine than ChatGPT), the polling pattern in [Usage over SSH](#usage-over-ssh) is the contract — wrap it in your own [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) if you want trigger-phrase activation.
+Original project and design by **Chris Liu** — **[github.com/chrisliu298/gpt-pro-relay](https://github.com/chrisliu298/gpt-pro-relay)**. This fork ([github.com/llv22/gpt-pro-relay](https://github.com/llv22/gpt-pro-relay)) adds the headless-Linux port, composer tools, and configurable model/paths.

@@ -7,7 +7,9 @@ __pycache__/
 dist/
 build/
 .gpt-pro-cookies*.json
-Q0-gpt-5.5-pro.md
+# query archive (see query/README.md): queries Q<N>-<slug>.md are TRACKED;
+# results R<N>-<slug>-<option>.md are model output — not committed.
+query/R[0-9]*.md
 # relocated run artifacts / state (GPT_PRO_RUNS_DIR / GPT_PRO_HOME) — never commit
 # these: they hold prompts, responses, chat URLs, and screenshots.
 runs/
