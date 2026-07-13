@@ -14,8 +14,15 @@ from pathlib import Path
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 PROFILE = Path.home() / ".gpt-pro-profile"
-STATE = Path.home() / ".gpt-pro"
-RUNS = STATE / "runs"
+# STATE holds locks + the default runs dir. GPT_PRO_HOME relocates the whole lot;
+# GPT_PRO_RUNS_DIR relocates ONLY the run artifacts (prompt/response/result/
+# screenshots), e.g. into a project folder, while the coordination locks stay put.
+# The parent `ask` and the detached `_run` worker both read these from the
+# inherited env, so they always agree. NB: the three locks live under STATE — keep
+# GPT_PRO_HOME consistent across concurrent workers or they won't coordinate
+# (relocating only RUNS is always safe; the locks stay shared under the default STATE).
+STATE = Path(os.environ.get("GPT_PRO_HOME", str(Path.home() / ".gpt-pro"))).expanduser()
+RUNS = Path(os.environ.get("GPT_PRO_RUNS_DIR", str(STATE / "runs"))).expanduser()
 LAUNCH_LOCK = STATE / "launch.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
 SLOT_LOCK_DIR = STATE / "slots"

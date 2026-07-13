@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 .gpt-pro-cookies*.json
+Q0-gpt-5.5-pro.md
+# relocated run artifacts / state (GPT_PRO_RUNS_DIR / GPT_PRO_HOME) — never commit
+# these: they hold prompts, responses, chat URLs, and screenshots.
+runs/
+.gpt-pro-state/

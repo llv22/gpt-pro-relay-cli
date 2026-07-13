@@ -137,7 +137,7 @@ Exit codes:
 
 ## Artifacts
 
-Each run writes to `~/.gpt-pro/runs/<run_id>/`:
+Each run writes to `~/.gpt-pro/runs/<run_id>/` by default. Set **`GPT_PRO_RUNS_DIR`** to relocate just the run artifacts (e.g. into a project folder), or **`GPT_PRO_HOME`** to relocate the whole state dir (runs + coordination locks). Both the `ask` parent and the detached worker read these from the environment, so export them before invoking. Keep `GPT_PRO_HOME` consistent across concurrent runs — the locks live under it (relocating only `GPT_PRO_RUNS_DIR` always keeps the locks shared). Run artifacts hold prompts, responses, and chat URLs; don't commit them.
 
 - `prompt.md` — input
 - `meta.json` — `{run_id, created_at, prompt_sha256}`
