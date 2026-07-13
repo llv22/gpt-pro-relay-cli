@@ -531,6 +531,23 @@ PRO_MODEL_SLUGS = _DEFAULT_PRO_MODEL_SLUGS | frozenset(
 )
 
 
+# ChatGPT composer tools — the "+"/"Add files and more" menu. `ask --tool <slug>`
+# exposes exactly what the ChatGPT UI offers; an unsupported slug fails at argparse
+# (choices) — "at the very beginning", before any browser work. Enabling a tool
+# clicks its `.__menu-item` row (custom divs, NOT role=menuitem) and a named pill
+# mounts in the composer. company-knowledge / google-drive need account connectors;
+# if a row isn't in this account's menu the worker fails with tool_unavailable
+# rather than silently sending without it. The label is matched by a ^prefix regex
+# because each row's text is "<Label><one-line description>" concatenated.
+COMPOSER_TOOLS = {
+    "create-image": "Create image",
+    "web-search": "Web search",
+    "company-knowledge": "Company knowledge",
+    "deep-research": "Deep research",
+    "google-drive": "Google Drive",
+}
+
+
 def is_pro_label(text: str | None) -> bool:
     """Predicate: chip text indicates the top "Pro" reasoning-effort tier.
 
@@ -669,6 +686,52 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
                 return True, final_text
             await asyncio.sleep(0.2)
         return False, final_text
+
+
+async def enable_composer_tools(page, tools: list[str], *, run_dir: Path) -> None:
+    """Enable each requested composer tool BEFORE the prompt is pasted.
+
+    Opens the composer "+" menu and clicks the tool's `.__menu-item` row (custom
+    divs, no role=menuitem, so matched by a ^label prefix over the row's
+    "<Label><description>" text), then confirms the named pill mounted in the
+    composer. Raises RuntimeError with a machine-readable reason if the menu won't
+    open, the row isn't in this account's menu (tool_unavailable — e.g. a connector
+    the workspace hasn't enabled), or the pill doesn't confirm — so a tool the
+    account can't provide fails loudly rather than silently sending without it.
+    Enable on the empty composer first; the caller pastes afterward."""
+    for slug in tools:
+        label = COMPOSER_TOOLS[slug]
+        await page.locator('[data-testid="composer-plus-btn"]').click()
+        try:
+            await page.wait_for_selector(".__menu-item", timeout=5000)
+        except Exception:
+            await safe_screenshot(page, run_dir / f"error-tool_menu-{slug}.png")
+            raise RuntimeError(f"tool_menu_open_failed:{slug}")
+        # ^label with NO trailing \b: each row's text is "<Label><description>"
+        # concatenated with no separator (e.g. "Web searchFind real-time news"),
+        # so \b after the label would never match. ^ anchors to the row start, so
+        # only the tool row (not a longer unrelated item) matches.
+        row = page.locator(".__menu-item").filter(
+            has_text=re.compile(rf"^{re.escape(label)}")
+        ).first
+        if not await row.count():
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await safe_screenshot(page, run_dir / f"error-tool_unavailable-{slug}.png")
+            raise RuntimeError(f"tool_unavailable:{slug}")
+        await row.click(timeout=5000)
+        # The menu closes on click; the active tool shows as a pill whose exact
+        # text is the label. Wait for it to confirm the toggle actually took.
+        try:
+            await page.get_by_text(
+                re.compile(rf"^{re.escape(label)}$")
+            ).first.wait_for(state="visible", timeout=5000)
+        except Exception:
+            await safe_screenshot(page, run_dir / f"error-tool_pill-{slug}.png")
+            raise RuntimeError(f"tool_enable_unconfirmed:{slug}")
+        log_stage("tool_enabled", tool=slug, label=label)
 
 
 # The selected MODEL is invisible in the chip — it's the checked radio inside the
@@ -984,6 +1047,7 @@ async def cmd_ask(args) -> int:
             "run_id": run_id,
             "created_at": time.time(),
             "prompt_sha256": prompt_sha,
+            "tools": args.tool or [],
         }
         atomic_write(run_dir / "meta.json", json.dumps(meta))
         _spawn_worker(run_id, run_dir)
@@ -1430,6 +1494,22 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                     return err("model_select_failed", {"chip_text": chip_text})
                 log_stage("model_verified", chip_text=chip_text)
 
+                # Composer tools (web-search / deep-research / …) are enabled on the
+                # empty composer BEFORE pasting. Persisted in meta.json by `ask`.
+                tools: list[str] = []
+                try:
+                    tools = json.loads((run_dir / "meta.json").read_text()).get("tools") or []
+                except Exception:
+                    tools = []
+                if tools:
+                    try:
+                        await enable_composer_tools(page, tools, run_dir=run_dir)
+                    except RuntimeError as e:
+                        (run_dir / "error.html").write_text(await page.content())
+                        log_stage("error", reason="tool_setup_failed", detail=str(e))
+                        return err("tool_setup_failed", {"detail": str(e), "tools": tools})
+                    log_stage("tools_enabled", tools=tools)
+
                 composer = page.get_by_role("textbox").first
                 await _focus_and_paste(page, composer, prompt_text)
                 log_stage("prompt_typed", chars=len(prompt_text))
@@ -1573,7 +1653,17 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 # is never quietly reported as a plain timeout. response.md is kept
                 # as a diagnostic artifact; the result is an error so it is never
                 # printed as a success.
-                if model_audit in ("slug_mismatch", "menu_mismatch"):
+                # With a composer tool active (deep-research / web-search / …) the
+                # turn is legitimately served by the tool's OWN model, so its slug
+                # won't be in the Pro allowlist. The user explicitly opted into the
+                # tool, so a mismatch is expected — degrade the audit to fail-OPEN
+                # (record the slug, don't reject). The model gate only guards the
+                # plain no-tool path.
+                if tools and model_audit in ("slug_mismatch", "menu_mismatch"):
+                    log_stage("tool_mode_model_unaudited", model_audit=model_audit,
+                              slug=served_slug, tools=tools)
+                    model_audit = "tool_mode_unaudited"
+                elif model_audit in ("slug_mismatch", "menu_mismatch"):
                     reason = "served_model_mismatch" if model_audit == "slug_mismatch" else "model_menu_mismatch"
                     await safe_screenshot(page, run_dir / f"error-{reason}.png")
                     log_stage("error", reason=reason, slug=served_slug, menu_model=menu_model)
@@ -1694,6 +1784,11 @@ def main() -> int:
                       help="Write response to this file (on macmini) instead of stdout. Stderr JSONL is unchanged. Ignored with --no-wait.")
     ask_p.add_argument("--no-wait", action="store_true",
                       help="Submit (or attach to) the run and exit 0 immediately after `submitted`. Use `fetch` to retrieve the response. Designed for short-session SSH polling — see SKILL.md.")
+    ask_p.add_argument("--tool", action="append", default=None, metavar="TOOL",
+                      choices=list(COMPOSER_TOOLS.keys()),
+                      help="Enable a ChatGPT composer tool before sending (repeatable). "
+                           "One of: " + ", ".join(COMPOSER_TOOLS) + ". An unsupported "
+                           "name exits immediately (argparse error).")
 
     fetch_p = sub.add_parser("fetch", help="Fetch the response of an existing run by id. Waits if still running.")
     fetch_p.add_argument("run_id")

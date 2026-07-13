@@ -21,7 +21,7 @@ def _args(run_id="test-cap"):
     # no_wait=True short-circuits cmd_ask before _wait_for_result, so the
     # accept path returns without needing a live worker.
     return types.SimpleNamespace(
-        run_id=run_id, no_wait=True, generation_timeout=1.0, output=None
+        run_id=run_id, no_wait=True, generation_timeout=1.0, output=None, tool=None
     )
 
 
