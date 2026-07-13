@@ -14,15 +14,18 @@ from pathlib import Path
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 PROFILE = Path.home() / ".gpt-pro-profile"
-# STATE holds locks + the default runs dir. GPT_PRO_HOME relocates the whole lot;
-# GPT_PRO_RUNS_DIR relocates ONLY the run artifacts (prompt/response/result/
-# screenshots), e.g. into a project folder, while the coordination locks stay put.
-# The parent `ask` and the detached `_run` worker both read these from the
-# inherited env, so they always agree. NB: the three locks live under STATE — keep
-# GPT_PRO_HOME consistent across concurrent workers or they won't coordinate
-# (relocating only RUNS is always safe; the locks stay shared under the default STATE).
+# STATE holds the coordination locks. GPT_PRO_HOME relocates it (default ~/.gpt-pro).
+# RUNS holds per-run artifacts (prompt/response/result/screenshots) and defaults to
+# ./runs in the CURRENT working directory — so a project checkout keeps its own runs
+# alongside its query/ archive, rather than burying them under ~/.gpt-pro. Precedence:
+# GPT_PRO_RUNS_DIR wins; else if GPT_PRO_HOME is set runs follow it (STATE/runs); else
+# ./runs. The parent `ask` and the detached `_run` worker both read these from the
+# inherited env + shared cwd, so they always agree. NB: the three locks live under
+# STATE — keep GPT_PRO_HOME consistent across concurrent workers or they won't
+# coordinate (relocating only RUNS is always safe; the locks stay shared under STATE).
 STATE = Path(os.environ.get("GPT_PRO_HOME", str(Path.home() / ".gpt-pro"))).expanduser()
-RUNS = Path(os.environ.get("GPT_PRO_RUNS_DIR", str(STATE / "runs"))).expanduser()
+_default_runs = str(STATE / "runs") if os.environ.get("GPT_PRO_HOME") else str(Path.cwd() / "runs")
+RUNS = Path(os.environ.get("GPT_PRO_RUNS_DIR", _default_runs)).expanduser()
 LAUNCH_LOCK = STATE / "launch.lock"
 CLIPBOARD_LOCK = STATE / "clipboard.lock"
 SLOT_LOCK_DIR = STATE / "slots"
@@ -1403,6 +1406,157 @@ class ParallelSlot:
             self.slot_id = None
 
 
+async def _standard_completion_and_extract(page, run_dir: Path, deadline: float, send_ts: float):
+    """The normal (no-tool / non-deep-research) completion gate + extraction.
+    Returns (completed, response, extraction). Writes streaming/final artifacts
+    and response.md, exactly as the inline flow did before deep-research forked it."""
+    last_text = ""
+    last_change = time.time()
+    snapshot_idx = 0
+    next_snap = time.time() + 5.0
+    completed = False
+    while time.time() < deadline:
+        now = time.time()
+        if now >= next_snap:
+            await safe_screenshot(page, run_dir / f"streaming-{snapshot_idx:03d}.png")
+            snapshot_idx += 1
+            next_snap = now + 30.0
+        try:
+            cur = await page.evaluate(
+                """() => {
+                    const e = document.querySelectorAll('[data-message-author-role="assistant"]');
+                    return e.length ? e[e.length - 1].innerText : '';
+                }"""
+            )
+        except Exception:
+            cur = ""
+        if cur != last_text:
+            last_change = now
+            last_text = cur
+        if cur and (now - last_change) >= 5.0:
+            stop = await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
+            if stop == 0 and await _copy_button_present(page):
+                completed = True
+                break
+        await asyncio.sleep(1.5)
+
+    log_stage(
+        "completion_detected" if completed else "completion_timeout",
+        chars=len(last_text),
+        elapsed_secs=round(time.time() - send_ts, 1),
+    )
+    await safe_screenshot(page, run_dir / "final.png")
+    (run_dir / "final.html").write_text(await page.content())
+
+    extraction = "innertext"
+    response = last_text
+    if completed:
+        copied = await _copy_button_extract(page)
+        if copied is not None:
+            response = copied
+            extraction = "copy_button"
+    log_stage("extracted", method=extraction, chars=len(response))
+    atomic_write(run_dir / "response.md", response)
+    return completed, response, extraction
+
+
+async def deep_research_extract(page, run_dir: Path, *, deadline: float, poll: float = 30.0):
+    """Extract a Deep Research report. The report renders in a cross-origin
+    SANDBOXED iframe (connector_openai_deep_research) with no DOM/clipboard access
+    — normal turn extraction returns nothing. The only export is the report's own
+    Export→Markdown download.
+
+    Completion is detected by the export SUCCEEDING (poll-until-export): the report
+    card's download icon + menu render only once research finishes, and the export
+    click coordinates (iframe top-right) sit clear of the in-progress card's
+    Update button (upper area) and Stop button (bottom), so an attempt made while
+    research is still running clicks empty card space and simply yields no file.
+    Coordinate-clicked via CDP because the export UI is inside the sandbox (no DOM
+    handle) — FRAGILE by construction; a screenshot per attempt aids debugging.
+    Returns (completed, report_markdown)."""
+    dldir = run_dir / "dr_download"
+    dldir.mkdir(parents=True, exist_ok=True)
+    IFRAME_SEL = 'iframe[src*="deep_research"], iframe[src*="oaiusercontent"]'
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await cdp.send("Browser.setDownloadBehavior",
+                       {"behavior": "allow", "downloadPath": str(dldir), "eventsEnabled": True})
+    except Exception as e:
+        log_stage("dr_download_behavior_failed", exception=f"{type(e).__name__}: {e}")
+
+    async def _click(x, y):
+        for t in ("mouseMoved", "mousePressed", "mouseReleased"):
+            ev = {"type": t, "x": x, "y": y}
+            if t != "mouseMoved":
+                ev.update({"button": "left", "clickCount": 1})
+            await cdp.send("Input.dispatchMouseEvent", ev)
+
+    async def _rect():
+        return await page.evaluate(
+            """(sel) => { const f = document.querySelector(sel); if (!f) return null;
+               f.scrollIntoView({block:'center'}); const r = f.getBoundingClientRect();
+               return {right: Math.round(r.right), top: Math.round(r.top),
+                       w: Math.round(r.width), h: Math.round(r.height)}; }""",
+            IFRAME_SEL,
+        )
+
+    async def _found_md():
+        mds = sorted(dldir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if mds:
+            txt = mds[0].read_text()
+            if len(txt) > 500:
+                return txt
+        return None
+
+    attempt = 0
+    while time.time() < deadline:
+        rect = await _rect()
+        vp = await page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+        # The report renders in the sandbox iframe. Card view has a narrow iframe
+        # (w≈640–768); the EXPANDED reader fills the viewport (w≈vp.w). Card-view
+        # icon coords proved unreliable, so operate in the expanded view, whose
+        # download icon + menu are at STABLE viewport-relative positions.
+        if rect and rect["w"] > 300 and rect["h"] > 150:
+            attempt += 1
+            expanded = rect["w"] >= vp["w"] - 100
+            if not expanded:
+                # Click candidate expand-icon offsets (iframe header top-right)
+                # until the iframe grows to ~viewport width. During research these
+                # offsets are empty card space (clear of the Update/Stop controls),
+                # so this is a no-op until the report is actually ready.
+                for dx in (37, 73, 110):
+                    await _click(rect["right"] - dx, rect["top"] + 58)
+                    await asyncio.sleep(1.2)
+                    r2 = await _rect()
+                    if r2 and r2["w"] >= vp["w"] - 100:
+                        rect, expanded = r2, True
+                        break
+                    try:
+                        await page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.3)
+            if expanded:
+                # Expanded reader: download icon ≈ (vp.w-79, 24); the export menu's
+                # "Export to Markdown" item ≈ (vp.w-175, 101). Verified 2026-07-12.
+                await _click(vp["w"] - 79, 24)
+                await asyncio.sleep(1.0)
+                await _click(vp["w"] - 175, 101)
+                await asyncio.sleep(2.0)
+            await safe_screenshot(page, run_dir / f"dr-export-attempt-{attempt:02d}.png")
+            txt = await _found_md()
+            if txt:
+                log_stage("dr_report_extracted", chars=len(txt), attempts=attempt, expanded=expanded)
+                return True, txt
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+        await asyncio.sleep(poll)
+    log_stage("dr_export_timeout", attempts=attempt)
+    return False, ""
+
+
 async def _browser_run(run_id: str, run_dir: Path, prompt_text: str) -> dict:
     network_log: list = []
 
@@ -1581,53 +1735,25 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                 log_stage("sent")
 
                 deadline = time.time() + DEFAULT_GENERATION_TIMEOUT
-                last_text = ""
-                last_change = time.time()
-                snapshot_idx = 0
-                next_snap = time.time() + 5.0
-                completed = False
-                while time.time() < deadline:
-                    now = time.time()
-                    if now >= next_snap:
-                        await safe_screenshot(page, run_dir / f"streaming-{snapshot_idx:03d}.png")
-                        snapshot_idx += 1
-                        next_snap = now + 30.0
+                if "deep-research" in tools:
+                    # Deep Research: report is in a sandboxed iframe; completion +
+                    # extraction both go through the Export→Markdown download.
+                    completed, response = await deep_research_extract(page, run_dir, deadline=deadline)
+                    extraction = "deep_research_export_md"
+                    log_stage(
+                        "completion_detected" if completed else "completion_timeout",
+                        chars=len(response),
+                        elapsed_secs=round(time.time() - send_ts, 1),
+                    )
+                    await safe_screenshot(page, run_dir / "final.png")
                     try:
-                        cur = await page.evaluate(
-                            """() => {
-                                const e = document.querySelectorAll('[data-message-author-role="assistant"]');
-                                return e.length ? e[e.length - 1].innerText : '';
-                            }"""
-                        )
+                        (run_dir / "final.html").write_text(await page.content())
                     except Exception:
-                        cur = ""
-                    if cur != last_text:
-                        last_change = now
-                        last_text = cur
-                    if cur and (now - last_change) >= 5.0:
-                        stop = await page.locator('button[aria-label*="Stop"], [data-testid*="stop"]').count()
-                        if stop == 0 and await _copy_button_present(page):
-                            completed = True
-                            break
-                    await asyncio.sleep(1.5)
-
-                log_stage(
-                    "completion_detected" if completed else "completion_timeout",
-                    chars=len(last_text),
-                    elapsed_secs=round(time.time() - send_ts, 1),
-                )
-                await safe_screenshot(page, run_dir / "final.png")
-                (run_dir / "final.html").write_text(await page.content())
-
-                extraction = "innertext"
-                response = last_text
-                if completed:
-                    copied = await _copy_button_extract(page)
-                    if copied is not None:
-                        response = copied
-                        extraction = "copy_button"
-                log_stage("extracted", method=extraction, chars=len(response))
-                atomic_write(run_dir / "response.md", response)
+                        pass
+                    atomic_write(run_dir / "response.md", response)
+                else:
+                    completed, response, extraction = await _standard_completion_and_extract(
+                        page, run_dir, deadline, send_ts)
 
                 # Authoritative post-hoc audit: the served assistant turn stamps
                 # the model that actually answered. The pre-send chip gate can
