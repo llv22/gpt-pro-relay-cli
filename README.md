@@ -150,11 +150,11 @@ If a session drops mid-run, **never re-run `ask` fresh** — recover with `fetch
 | 4 | run_dir not found (fetch) |
 | 124 | wait timed out, run still pending |
 
-## Research archive (private sub-repo)
+## Suggested: research as a private sub-repo
 
-Queries relayed through this CLI and their results are **not** stored in this repo — research topics stay internal. They live in a **separate private repo** cloned into a git-ignored `research/` folder. It is deliberately **not** a git submodule, so the public repo holds no reference to it (a `.gitmodules` entry would leak the private repo's URL).
+If you use this CLI for research, we suggest keeping your queries and results **out of any public repo** so topics stay internal. A clean pattern: put them in a **separate private repo** cloned into a git-ignored `research/` folder. Keep it a plain nested repo, **not** a git submodule, so the public repo holds no reference to it (a `.gitmodules` entry would leak the private repo's URL).
 
-Structure — one folder per query, grouping a prompt with all of its answers:
+Suggested structure — one folder per query, grouping a prompt with all of its answers:
 
 ```
 research/                          # private repo, git-ignored in this checkout
