@@ -6,4 +6,4 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.gpt-pro-cookies.json
+.gpt-pro-cookies*.json

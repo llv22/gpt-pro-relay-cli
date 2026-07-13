@@ -36,6 +36,63 @@ DEFAULT_GOTO_RETRIES = 1
 CHROME_APP = "/Applications/Google Chrome.app"
 LAUNCH_DEBUG_PORT = 19222
 
+# --- Platform fork (GPT_PRO_HEADLESS) --------------------------------------
+# The tool is macOS-native (LaunchServices launch + pbcopy/pbpaste clipboard).
+# On a GUI-less Linux box the *same* shared-Chrome-over-CDP architecture and the
+# three locks are preserved; only three seams change, each gated on IS_MAC:
+#   1. launch — direct binary exec + new headless (no `open -a`, no compositor)
+#   2. paste  — Chrome's in-browser clipboard (writeText + Ctrl+V), no pasteboard
+#   3. extract— Copy button + navigator.clipboard.readText(), no pbpaste
+# Verified against the spike/ gates on 2026-07-12 (see spike/README.md).
+IS_MAC = sys.platform == "darwin"
+
+# OLD headless advertises "HeadlessChrome" in the UA, which Cloudflare's managed
+# challenge walls before ChatGPT loads. NEW headless + this plain Linux-Chrome UA
+# clears it (spike-verified 2026-07-12).
+HEADLESS_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+)
+
+# Server-Chrome stability flags the headless-Linux launch needs and macOS doesn't:
+#  - --no-sandbox: this distro (Ubuntu 23.10+) disables unprivileged user
+#    namespaces via AppArmor, so Chrome's zygote sandbox FATALs ("No usable
+#    sandbox"). Playwright's own launcher passes --no-sandbox by default for this
+#    reason, and the spike ran real Pro sends with it — it does NOT trip ChatGPT's
+#    anti-abuse here (the CLAUDE.md anti-detection note is calibrated for the GUI
+#    Mac). Override with GPT_PRO_NO_SANDBOX=0 on a box where userns works.
+#  - --disable-dev-shm-usage: a server's small /dev/shm crashes the renderer on
+#    large pages.
+LINUX_HEADLESS_ARGS = [
+    "--headless=new",
+    "--disable-dev-shm-usage",
+]
+
+
+def _chrome_binary() -> str:
+    """Path to the real Chrome binary for the Linux headless launch.
+
+    Prefers an explicit GPT_PRO_CHROME_BINARY, then a system Google Chrome, then
+    a rootless Chrome-for-Testing extraction (the spike default). Real Chrome
+    (branded or Chrome-for-Testing), never bundled Chromium — the auth/anti-abuse
+    invariant. Raises with a clear message if none is found."""
+    env = os.environ.get("GPT_PRO_CHROME_BINARY")
+    if env:
+        return env
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
+        str(Path.home() / ".cache/chrome-for-testing/chrome-linux64/chrome"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise RuntimeError(
+        "No Chrome binary found for headless Linux launch. Set GPT_PRO_CHROME_BINARY "
+        f"or install Google Chrome. Looked at: {candidates}"
+    )
+
 
 MAX_PARALLEL_CEILING = 10  # Personal-use ceiling per CLAUDE.md / README.md.
 
@@ -81,6 +138,24 @@ def _chrome_open_argv(port: int) -> list[str]:
         f"--remote-debugging-port={port}",
         f"--user-data-dir={PROFILE}",
     ]
+
+
+def _chrome_launch_command(port: int) -> list[str]:
+    """The full argv to spawn the shared Chrome — the ONE place the launch forks.
+
+    macOS routes through LaunchServices (`open -n -a`) so Chrome gets a real Aqua
+    identity and a compositor surface (see CHROME_OPEN_ARGS). Headless Linux has
+    neither concern: exec the binary directly (a LaunchServices-less exec is
+    exactly what macOS *couldn't* use), in NEW headless, with a spoofed UA so
+    Cloudflare doesn't wall the session. Both share the identical `_chrome_open_argv`
+    flag set — the invariant that login/doctor/_run never drift."""
+    argv = _chrome_open_argv(port)
+    if IS_MAC:
+        return ["/usr/bin/open", "-n", "-a", CHROME_APP, "--args", *argv]
+    extra = [*LINUX_HEADLESS_ARGS, f"--user-agent={HEADLESS_UA}"]
+    if os.environ.get("GPT_PRO_NO_SANDBOX", "1") != "0":
+        extra.append("--no-sandbox")
+    return [_chrome_binary(), *argv, *extra]
 
 
 async def pin_viewport_cdp(context, page, *, width: int = 1280, height: int = 800) -> None:
@@ -295,12 +370,12 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
                 "then run `gpt-pro-relay close-chrome --force` if Chrome is wedged."
             )
         _kill_chrome_orphans()
-        argv = _chrome_open_argv(port)
         subprocess.Popen(
-            ["/usr/bin/open", "-n", "-a", CHROME_APP, "--args", *argv],
+            _chrome_launch_command(port),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=not IS_MAC,
         )
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -328,7 +403,17 @@ async def connect_shared_chrome(pw, port: int = LAUNCH_DEBUG_PORT):
     while True:
         browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         if browser.contexts:
-            return browser.contexts[0]
+            ctx = browser.contexts[0]
+            # Headless clipboard I/O (writeText/readText) needs an explicit
+            # permission grant; macOS uses the OS pasteboard and never calls these.
+            if not IS_MAC:
+                try:
+                    await ctx.grant_permissions(
+                        ["clipboard-read", "clipboard-write"], origin="https://chatgpt.com"
+                    )
+                except Exception as e:
+                    log_stage("grant_permissions_skipped", exception=f"{type(e).__name__}: {e}")
+            return ctx
         if time.time() >= deadline:
             raise RuntimeError("connect_over_cdp returned no contexts after 5s")
         await asyncio.sleep(0.25)
@@ -425,7 +510,18 @@ PRO_TOKEN = "Pro"
 # audit catches an effort downgrade as well as a model swap — only Pro-on-Sol
 # maps into this allowlist. The pre-send chip ("Pro") is a fast fail; the slug is
 # authoritative. The one thing neither can see is a *missing* slug (fail-open).
-PRO_MODEL_SLUGS = frozenset({"gpt-5-6-pro"})
+#
+# The shipped default is Sol-only (fail-closed). GPT_PRO_MODEL_SLUGS lets the
+# account owner opt additional Pro-family slugs into the allowlist WITHOUT
+# weakening the default — e.g. an account that lacks GPT-5.6 Sol and accepts
+# GPT-5.5 at Pro effort sets GPT_PRO_MODEL_SLUGS=gpt-5-5-pro. Comma-separated;
+# unioned with the default so Sol always stays valid. The effort tier is still
+# encoded in the slug (…-pro = Pro effort), so allowlisting `gpt-5-5-pro` keeps
+# the fail-closed effort gate intact for GPT-5.5.
+_DEFAULT_PRO_MODEL_SLUGS = frozenset({"gpt-5-6-pro"})
+PRO_MODEL_SLUGS = _DEFAULT_PRO_MODEL_SLUGS | frozenset(
+    s.strip() for s in os.environ.get("GPT_PRO_MODEL_SLUGS", "").split(",") if s.strip()
+)
 
 
 def is_pro_label(text: str | None) -> bool:
@@ -953,6 +1049,24 @@ async def _focus_and_paste(page, composer, prompt_text: str) -> None:
     inputs; Cmd+V hits the contenteditable's optimized paste handler. Saves and
     restores the user's clipboard since the Mac mini may be in interactive use.
     """
+    if not IS_MAC:
+        # Headless Linux: Chrome's IN-BROWSER clipboard (no OS pasteboard). Same
+        # optimized ProseMirror paste handler as Cmd+V; still under UiClipboardLock
+        # because the in-browser clipboard is one-per-Chrome, shared across tabs.
+        # No pbpaste save/restore — there is no user pasteboard to protect.
+        with UiClipboardLock():
+            await bring_tab_to_front(page)
+            await page.evaluate("t => navigator.clipboard.writeText(t)", prompt_text)
+            await composer.click()
+            await page.keyboard.press("Control+v")
+            try:
+                await page.wait_for_selector(
+                    '[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]',
+                    timeout=10000, state="visible",
+                )
+            except Exception as e:
+                log_stage("paste_settle_skipped", exception=f"{type(e).__name__}: {e}")
+        return
     with UiClipboardLock():
         bind_chrome_compositor_surface()
         await bring_tab_to_front(page)
@@ -1043,6 +1157,34 @@ async def _copy_button_extract(page) -> str | None:
     even on early-return paths — otherwise we'd leak the assistant's response into
     the user's clipboard if pbpaste(after) raises.
     """
+    if not IS_MAC:
+        # Headless Linux: Copy button -> navigator.clipboard.readText(). No OS
+        # pasteboard, so nothing to save/restore. Under UiClipboardLock because the
+        # in-browser clipboard is shared across this Chrome's tabs.
+        with UiClipboardLock():
+            await bring_tab_to_front(page)
+            try:
+                clicked = await page.evaluate("""() => {
+                    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+                    const last = msgs[msgs.length - 1];
+                    if (!last) return false;
+                    const container = last.closest('[data-testid^="conversation-turn"]') || last.parentElement;
+                    if (!container) return false;
+                    const btn = container.querySelector('[data-testid="copy-turn-action-button"]');
+                    if (!btn) return false;
+                    btn.click();
+                    return true;
+                }""")
+            except Exception:
+                return None
+            if not clicked:
+                return None
+            await asyncio.sleep(0.6)
+            try:
+                txt = await page.evaluate("() => navigator.clipboard.readText()")
+            except Exception:
+                return None
+            return txt if (txt and txt.strip()) else None
     with UiClipboardLock():
         bind_chrome_compositor_surface()
         await bring_tab_to_front(page)

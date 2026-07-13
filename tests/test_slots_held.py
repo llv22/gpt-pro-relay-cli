@@ -110,7 +110,7 @@ def _wire_recovery(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.time, "sleep", lambda *_a: None)
     monkeypatch.setattr(cli, "log_stage", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda *_a, **_k: None)
-    monkeypatch.setattr(cli, "_chrome_open_argv", lambda port: [])
+    monkeypatch.setattr(cli, "_chrome_launch_command", lambda port: ["true"])
     calls = {"kill": 0, "popen": 0}
     monkeypatch.setattr(cli, "_kill_chrome_orphans",
                         lambda: calls.__setitem__("kill", calls["kill"] + 1))
