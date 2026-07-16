@@ -7,6 +7,10 @@ __pycache__/
 dist/
 build/
 .gpt-pro-cookies*.json
+# Session token exports (secret — never commit; may be dropped in the repo root
+# without a leading dot, e.g. gpt-pro-token-YYYYMMDD.json).
+gpt-pro-token*.json
+.gpt-pro-token*.json
 .gpt-pro-env.sh
 # Private research archive — a separate private repo cloned into research/.
 # Never committed to this public repo (topics stay internal). See README.
