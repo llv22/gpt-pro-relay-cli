@@ -99,10 +99,14 @@ class _DummyLock:
         return False
 
 
-def _wire_recovery(monkeypatch, tmp_path):
+def _wire_recovery(monkeypatch, tmp_path, *, chrome_procs_exist: bool = True):
     """Drive ensure_shared_chrome_running down the wedged-CDP recovery path with
     all real side effects (kill, relaunch) mocked. probe_cdp reports wedged for
-    the fast probe + 2 re-probes, then healthy once the relaunch is issued."""
+    the fast probe + 2 re-probes, then healthy once the relaunch is issued.
+
+    chrome_procs_exist controls _chrome_processes_exist(): True (default) simulates
+    a genuinely-wedged Chrome; False simulates a cold-start burst (Chrome never launched).
+    """
     slots = tmp_path / "slots"
     slots.mkdir(exist_ok=True)
     monkeypatch.setattr(cli, "SLOT_LOCK_DIR", slots)
@@ -111,6 +115,7 @@ def _wire_recovery(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "log_stage", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "bind_chrome_compositor_surface", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "_chrome_launch_command", lambda port: ["true"])
+    monkeypatch.setattr(cli, "_chrome_processes_exist", lambda: chrome_procs_exist)
     calls = {"kill": 0, "popen": 0}
     monkeypatch.setattr(cli, "_kill_chrome_orphans",
                         lambda: calls.__setitem__("kill", calls["kill"] + 1))
@@ -140,7 +145,8 @@ def test_ensure_chrome_recovers_when_only_own_slot_held(tmp_path, monkeypatch):
 
 
 def test_ensure_chrome_refuses_when_sibling_slot_held(tmp_path, monkeypatch):
-    slots, calls = _wire_recovery(monkeypatch, tmp_path)
+    # Genuinely-wedged Chrome (procs exist): sibling slot → must raise.
+    slots, calls = _wire_recovery(monkeypatch, tmp_path, chrome_procs_exist=True)
     fd0 = _hold(slots / "slot-0.lock")  # own
     fd1 = _hold(slots / "slot-1.lock")  # a genuinely-active sibling
     try:
@@ -150,3 +156,18 @@ def test_ensure_chrome_refuses_when_sibling_slot_held(tmp_path, monkeypatch):
         _release(fd0, fd1)
     assert calls["kill"] == 0         # never killed Chrome out from under the sibling
     assert calls["popen"] == 0
+
+
+def test_ensure_chrome_launches_on_cold_burst_with_sibling_slot(tmp_path, monkeypatch):
+    # Cold-start burst (no Chrome procs): sibling slot must NOT block launch.
+    # The sibling holds a slot but has no live tab — Chrome was never started.
+    slots, calls = _wire_recovery(monkeypatch, tmp_path, chrome_procs_exist=False)
+    fd0 = _hold(slots / "slot-0.lock")  # own
+    fd1 = _hold(slots / "slot-1.lock")  # sibling queued for cold Chrome
+    try:
+        result = cli.ensure_shared_chrome_running(skip_slot_id=0)
+    finally:
+        _release(fd0, fd1)
+    assert result is True             # performed the launch
+    assert calls["kill"] == 1
+    assert calls["popen"] == 1

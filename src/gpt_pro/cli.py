@@ -374,11 +374,17 @@ def ensure_shared_chrome_running(port: int = LAUNCH_DEBUG_PORT, skip_slot_id: in
         # using the shared Chrome — they'd lose their tabs. Surface a clear
         # error for the operator.
         if _slots_held(skip_slot_id=skip_slot_id):
-            raise RuntimeError(
-                "Chrome CDP unresponsive but other workers hold ParallelSlots; "
-                "refusing to kill shared Chrome. Wait for active runs to finish, "
-                "then run `gpt-pro-relay close-chrome --force` if Chrome is wedged."
-            )
+            if _chrome_processes_exist():
+                raise RuntimeError(
+                    "Chrome CDP unresponsive but other workers hold ParallelSlots; "
+                    "refusing to kill shared Chrome. Wait for active runs to finish, "
+                    "then run `gpt-pro-relay close-chrome --force` if Chrome is wedged."
+                )
+            # Cold-start burst: no Chrome procs exist so there are no live tabs to
+            # protect. Fall through — LaunchLock serializes the launch; the sibling
+            # that enters the lock after us will fast-path on its re-probe once
+            # Chrome is up.
+            log_stage("cold_burst_launch", skip_slot_id=skip_slot_id)
         _kill_chrome_orphans()
         subprocess.Popen(
             _chrome_launch_command(port),
@@ -427,6 +433,23 @@ async def connect_shared_chrome(pw, port: int = LAUNCH_DEBUG_PORT):
         if time.time() >= deadline:
             raise RuntimeError("connect_over_cdp returned no contexts after 5s")
         await asyncio.sleep(0.25)
+
+
+def _chrome_processes_exist() -> bool:
+    """True if any Chrome process is currently bound to our profile.
+
+    Non-destructive — only checks, does not kill. Used to distinguish a
+    genuinely-wedged Chrome (processes exist, CDP unresponsive) from a cold-start
+    burst (no processes; Chrome was never launched, so no live tabs to protect).
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={PROFILE}"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        return bool(out.strip())
+    except Exception:
+        return False
 
 
 def _kill_chrome_orphans() -> None:
@@ -1869,6 +1892,24 @@ async def cmd_run(args) -> int:
     return result.get("exit_code", 1)
 
 
+# ---- warm-chrome ----
+
+def cmd_warm_chrome() -> int:
+    """Ensure the shared Chrome is running and CDP-ready.
+
+    Lighter than doctor — no page navigation, no model check. Run before a
+    parallel burst so workers hit the connect fast-path instead of racing to
+    launch Chrome from inside their ParallelSlots.
+    """
+    launched = ensure_shared_chrome_running()
+    print(json.dumps({
+        "status": "ok",
+        "chrome": "launched" if launched else "already_up",
+        "port": LAUNCH_DEBUG_PORT,
+    }))
+    return 0
+
+
 # ---- close-chrome ----
 
 def cmd_close_chrome(force: bool = False) -> int:
@@ -1897,6 +1938,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="Open Chrome on chatgpt.com to sign in. Cookies persist for `ask`.")
     sub.add_parser("doctor", help="Verify the profile is logged in. Prints JSON; saves screenshot + HTML.")
+    sub.add_parser("warm-chrome", help="Ensure Chrome is running. Run before a parallel burst to avoid the cold-start race.")
     close_p = sub.add_parser("close-chrome", help="Tear down the shared gpt-pro Chrome. Refuses if workers are in flight.")
     close_p.add_argument("--force", action="store_true",
                          help="Kill Chrome even if workers hold ParallelSlots. In-flight runs will lose their CDP connection.")
@@ -1932,6 +1974,8 @@ def main() -> int:
         return asyncio.run(cmd_login())
     if args.cmd == "doctor":
         return asyncio.run(cmd_doctor())
+    if args.cmd == "warm-chrome":
+        return cmd_warm_chrome()
     if args.cmd == "ask":
         return asyncio.run(cmd_ask(args))
     if args.cmd == "fetch":
