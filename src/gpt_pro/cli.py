@@ -872,6 +872,37 @@ async def wait_for_login(ctx, *, timeout: float = 600.0) -> bool:
 
 # ---- doctor ----
 
+async def detect_logged_out(page, *, _unused: float = 8.0) -> str | None:
+    """Return a human reason if ChatGPT is serving a LOGGED-OUT page, else None.
+
+    The cookie-based login check (`wait_for_login`/`is_logged_in`) only proves the session
+    cookie is PRESENT locally — the server can still REJECT an expired token and serve the
+    "no-auth login" wall. Reading the cookie jar then false-passes, and the real failure only
+    surfaces later as a cryptic composer/effort-chip timeout that reads like a UI/selector bug
+    (it cost a long misdiagnosis on 2026-07-17). This reads the SERVED page so an expired token
+    reports explicitly as `needs_reauth` ("replace the token"). Conservative: a present composer
+    means logged-in, so we never false-flag a hydrating logged-in page. Redesign-resilient:
+    matches the auth-modal testid OR the logged-out landing copy."""
+    try:
+        res = await page.evaluate(
+            """() => {
+              const modal = document.querySelector('#modal-no-auth-login,[data-testid="modal-no-auth-login"]');
+              const composer = document.querySelector('#prompt-textarea,[contenteditable="true"][role="textbox"]');
+              const landing = /log in to get answers|stay logged out|sign up for free/i.test(document.body.innerText||'');
+              return {modal: !!modal, composer: !!composer, landing};
+            }"""
+        )
+    except Exception:
+        return None
+    if res.get("composer"):
+        return None  # composer present => authenticated; never flag a hydrating logged-in page
+    if res.get("modal"):
+        return "served the no-auth-login modal (session token rejected)"
+    if res.get("landing"):
+        return "served the logged-out landing page (login/signup copy, no composer)"
+    return None
+
+
 async def cmd_doctor() -> int:
     run_dir = new_run_dir("doctor")
     ensure_shared_chrome_running()
@@ -906,9 +937,18 @@ async def cmd_doctor() -> int:
                     model_status = f"failed: {type(e).__name__}: {e}"
             # doctor is green ONLY when login + Pro effort + Sol model are all
             # positively confirmed; a wrong OR unconfirmable chip/model is red.
-            checks_ok = doctor_exit_ok(ok, chip_status, model_status)
+            # Explicit expired/rejected-token detection from the SERVED page. Distinguishes
+            # "token invalid → reconfigure" (needs_reauth) from "logged in but chip/model wrong"
+            # (misconfigured), so the failure is actionable at a glance instead of a cryptic chip
+            # timeout. Overrides the cookie-based status because cookie-presence false-passes.
+            logged_out_reason = await detect_logged_out(page)
+            checks_ok = doctor_exit_ok(ok, chip_status, model_status) and not logged_out_reason
+            if logged_out_reason:
+                status = "needs_reauth"
+            else:
+                status = "ok" if checks_ok else ("needs_reauth" if not ok else "misconfigured")
             result = {
-                "status": "ok" if checks_ok else ("needs_reauth" if not ok else "misconfigured"),
+                "status": status,
                 "url": page.url,
                 "chip": chip_status,
                 "chip_text": chip_text,
@@ -916,6 +956,13 @@ async def cmd_doctor() -> int:
                 "model_text": model_text,
                 "run_dir": str(run_dir),
             }
+            if logged_out_reason:
+                result["reauth_reason"] = logged_out_reason
+                result["action_required"] = (
+                    "ChatGPT session TOKEN EXPIRED/REJECTED — replace the token JSON "
+                    "(frameworks/gpt-pro-relay-cli/gpt-pro-token-<date>.json) and re-seed the "
+                    "profile (docs/SETUP.md). This is NOT a UI/selector problem."
+                )
         finally:
             try:
                 await page.close()
@@ -1661,6 +1708,19 @@ async def _run_with_browser(run_id, run_dir, prompt_text, network_log, err, slot
                     (run_dir / "error.html").write_text(await page.content())
                     log_stage("error", reason="needs_reauth")
                     return err("needs_reauth")
+                # Cookie-presence != server acceptance: an expired/rejected token still serves the
+                # logged-out no-auth wall. Detect it EXPLICITLY and fail fast with an actionable
+                # reason ("replace the token") instead of a cryptic downstream chip/composer timeout
+                # that reads as a UI bug. Surfaced early so the operator can reconfigure ASAP.
+                logged_out_reason = await detect_logged_out(page)
+                if logged_out_reason:
+                    await safe_screenshot(page, run_dir / "error-needs_reauth.png")
+                    (run_dir / "error.html").write_text(await page.content())
+                    log_stage("error", reason="needs_reauth", detail=logged_out_reason,
+                              action_required="TOKEN EXPIRED/REJECTED — replace gpt-pro-token-<date>.json "
+                                              "and re-seed the profile (docs/SETUP.md); NOT a UI problem")
+                    return err("needs_reauth", {"detail": logged_out_reason,
+                               "action_required": "replace the ChatGPT token JSON + re-seed the profile"})
                 log_stage("logged_in")
 
                 ok, chip_text = await ensure_pro_chip(page, run_dir=run_dir)
