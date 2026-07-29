@@ -738,30 +738,51 @@ async def _open_composer_tool_menu(page, *, slug: str, run_dir: Path):
     (observed 2026-07-29 for both deep-research and web-search on an account whose
     menu demonstrably offers both). Never reintroduce a `.__menu-item` gate here.
 
-    The first click intermittently does not open the popover, so retry once."""
+    The first click intermittently does not open the popover, so retry once.
+
+    Wait on the CONTAINER being visible, never on `get_by_text(...).first`. The
+    anchor string also appears in non-visible nodes (the composer "+" now carries
+    `interestfor`/`aria-describedby` and mounts several sibling `[popover]` hint
+    elements), so `.first` can resolve to a hidden duplicate and time out on it
+    while the real menu is open right next to it — which is exactly what happened
+    on 2026-07-29 (`tool_menu_open_failed:deep-research`) even though a single
+    click demonstrably opens a popover containing "Add photos & files".
+
+    And NEVER click blind on the retry: the popover is a native `[popover]` that
+    does not reliably close on `Escape`, so a second unconditional click TOGGLES
+    THE OPEN MENU SHUT. That double-toggle is why the failure artifact captured
+    zero popover elements and read as "the menu never opens"."""
     plus = page.locator('[data-testid="composer-plus-btn"]')
-    for attempt in (1, 2):
+    container = page.locator(TOOL_MENU_CONTAINER).filter(has_text=TOOL_MENU_ANCHOR)
+
+    async def _open_container():
+        """Return the container if a visible one is already mounted, else None."""
         try:
-            await plus.first.click(timeout=5000)
+            if await container.count() and await container.last.is_visible():
+                return container.last
         except Exception:
             pass
-        try:
-            await page.get_by_text(TOOL_MENU_ANCHOR, exact=False).first.wait_for(
-                state="visible", timeout=6000
-            )
-            container = page.locator(TOOL_MENU_CONTAINER).filter(
-                has_text=TOOL_MENU_ANCHOR
-            ).last
-            if await container.count():
-                return container
-        except Exception:
-            pass
-        if attempt == 1:
-            # Close any half-open state before retrying so the click toggles open.
+        return None
+
+    for attempt in (1, 2, 3):
+        if await _open_container() is None:
             try:
-                await page.keyboard.press("Escape")
+                await plus.first.click(timeout=5000)
             except Exception:
                 pass
+        try:
+            await container.last.wait_for(state="visible", timeout=6000)
+            return container.last
+        except Exception:
+            pass
+        if attempt < 3:
+            # Only try to dismiss if something IS open; otherwise the next
+            # iteration's click is the one that opens it.
+            if await _open_container() is not None:
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
             await asyncio.sleep(1.0)
     # Capture evidence BEFORE any Escape — the old code pressed Escape first, which
     # closed the menu and made every saved artifact useless for diagnosis.
