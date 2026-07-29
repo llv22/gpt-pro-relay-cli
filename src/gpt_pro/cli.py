@@ -714,12 +714,68 @@ async def ensure_pro_chip(page, *, run_dir: Path) -> tuple[bool, str | None]:
         return False, final_text
 
 
+# Content anchor proving the composer "+" popover is actually open. The menu is a
+# plain <div> whose class contains "popover" (e.g. "z-50 rounded-2xl popover
+# bg-token-main-surface-primary shadow-long") — it is NOT role="menu", NOT a Radix
+# popper wrapper, and its rows are NOT ".__menu-item". "Add photos & files" is the
+# first row and is present for every account (unlike the connector-gated rows), so
+# it is the stable "menu is open" signal. Verified live 2026-07-29; the full menu
+# read: Add photos & files / Create image / Web search / Company knowledge /
+# Deep research / Google Drive / Visualize / Atlassian Rovo / Connect.
+TOOL_MENU_ANCHOR = "Add photos & files"
+TOOL_MENU_CONTAINER = 'div[class*="popover"]'
+
+
+async def _open_composer_tool_menu(page, *, slug: str, run_dir: Path):
+    """Click the composer "+" and return the open tool-menu container.
+
+    Waits on a CONTENT anchor, not on a class. The previous implementation waited
+    for ".__menu-item" — but that class belongs to the chat-history SIDEBAR rows
+    (43-106 of them exist on every page load, independent of any menu), so the wait
+    succeeded instantly whether or not the menu opened, and the subsequent
+    ".__menu-item" label filter could never match a tool row even when the menu WAS
+    open. Net effect: every `--tool` run reported a false `tool_unavailable`
+    (observed 2026-07-29 for both deep-research and web-search on an account whose
+    menu demonstrably offers both). Never reintroduce a `.__menu-item` gate here.
+
+    The first click intermittently does not open the popover, so retry once."""
+    plus = page.locator('[data-testid="composer-plus-btn"]')
+    for attempt in (1, 2):
+        try:
+            await plus.first.click(timeout=5000)
+        except Exception:
+            pass
+        try:
+            await page.get_by_text(TOOL_MENU_ANCHOR, exact=False).first.wait_for(
+                state="visible", timeout=6000
+            )
+            container = page.locator(TOOL_MENU_CONTAINER).filter(
+                has_text=TOOL_MENU_ANCHOR
+            ).last
+            if await container.count():
+                return container
+        except Exception:
+            pass
+        if attempt == 1:
+            # Close any half-open state before retrying so the click toggles open.
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+    # Capture evidence BEFORE any Escape — the old code pressed Escape first, which
+    # closed the menu and made every saved artifact useless for diagnosis.
+    (run_dir / f"error-tool_menu-{slug}.html").write_text(await page.content())
+    await safe_screenshot(page, run_dir / f"error-tool_menu-{slug}.png")
+    raise RuntimeError(f"tool_menu_open_failed:{slug}")
+
+
 async def enable_composer_tools(page, tools: list[str], *, run_dir: Path) -> None:
     """Enable each requested composer tool BEFORE the prompt is pasted.
 
-    Opens the composer "+" menu and clicks the tool's `.__menu-item` row (custom
-    divs, no role=menuitem, so matched by a ^label prefix over the row's
-    "<Label><description>" text), then confirms the named pill mounted in the
+    Opens the composer "+" popover (see `_open_composer_tool_menu`) and clicks the
+    tool's row, matched by a ^label prefix over the row's "<Label><description>"
+    text SCOPED TO THAT CONTAINER, then confirms the named pill mounted in the
     composer. Raises RuntimeError with a machine-readable reason if the menu won't
     open, the row isn't in this account's menu (tool_unavailable — e.g. a connector
     the workspace hasn't enabled), or the pill doesn't confirm — so a tool the
@@ -727,25 +783,23 @@ async def enable_composer_tools(page, tools: list[str], *, run_dir: Path) -> Non
     Enable on the empty composer first; the caller pastes afterward."""
     for slug in tools:
         label = COMPOSER_TOOLS[slug]
-        await page.locator('[data-testid="composer-plus-btn"]').click()
-        try:
-            await page.wait_for_selector(".__menu-item", timeout=5000)
-        except Exception:
-            await safe_screenshot(page, run_dir / f"error-tool_menu-{slug}.png")
-            raise RuntimeError(f"tool_menu_open_failed:{slug}")
+        menu = await _open_composer_tool_menu(page, slug=slug, run_dir=run_dir)
         # ^label with NO trailing \b: each row's text is "<Label><description>"
         # concatenated with no separator (e.g. "Web searchFind real-time news"),
         # so \b after the label would never match. ^ anchors to the row start, so
-        # only the tool row (not a longer unrelated item) matches.
-        row = page.locator(".__menu-item").filter(
-            has_text=re.compile(rf"^{re.escape(label)}")
-        ).first
+        # only the tool row (not a longer unrelated item) matches. Scoping to the
+        # popover is what keeps sidebar rows out of the candidate set.
+        row = menu.locator("div", has_text=re.compile(rf"^{re.escape(label)}")).last
         if not await row.count():
+            # Evidence first, Escape second (see _open_composer_tool_menu).
+            (run_dir / f"error-tool_unavailable-{slug}.html").write_text(
+                await page.content()
+            )
+            await safe_screenshot(page, run_dir / f"error-tool_unavailable-{slug}.png")
             try:
                 await page.keyboard.press("Escape")
             except Exception:
                 pass
-            await safe_screenshot(page, run_dir / f"error-tool_unavailable-{slug}.png")
             raise RuntimeError(f"tool_unavailable:{slug}")
         await row.click(timeout=5000)
         # The menu closes on click; the active tool shows as a pill whose exact
